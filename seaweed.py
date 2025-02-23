@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 from mmditx import MMDiTX, DismantledBlock, PatchEmbed, TimestepEmbedder, VectorEmbedder
+from pylint.lint import Run
+from logger import logger
+
 
 class APTCrossAttentionBlock(nn.Module):
     """Cross-attention block used in APT discriminator."""
@@ -200,90 +203,6 @@ class APTCrossAttentionBlock(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, -1, self.hidden_size)
         return self.proj(x)
 
-class APTDiscriminator(nn.Module):
-    """Discriminator using MMDiT backbone (Section 3.3)."""
-    def __init__(self, mmdit_model: MMDiTX, cross_attn_layers=[16, 26, 36], max_timesteps=1000, device=None, dtype=torch.bfloat16):
-        super().__init__()
-        self.mmdit = mmdit_model
-        self.hidden_size = mmdit_model.x_embedder.proj.out_channels  # Adjusted for MMDiTX
-        self.num_heads = mmdit_model.num_heads
-        self.max_timesteps = max_timesteps
-        self.cross_attn_blocks = nn.ModuleList([APTCrossAttentionBlock(self.hidden_size, self.num_heads, device, dtype) for _ in cross_attn_layers])
-        self.cross_attn_layers = cross_attn_layers
-        self.final_norm = nn.LayerNorm(self.hidden_size * len(cross_attn_layers), dtype=dtype, device=device)
-        self.final_proj = nn.Linear(self.hidden_size * len(cross_attn_layers), 1, dtype=dtype, device=device)
-
-    def _shift_timestep(self, t: torch.Tensor, shift: float) -> torch.Tensor:
-        return shift * t / (1 + (shift - 1) * t)
-
-    def _get_features(self, x: torch.Tensor, c: torch.Tensor, t: torch.Tensor) -> List[torch.Tensor]:
-        features = []
-        x = self.mmdit.x_embedder(x.squeeze(1) if x.dim() == 5 else x)
-        c_mod = self.mmdit.t_embedder(t, dtype=x.dtype)
-        if c is not None and hasattr(self.mmdit, 'y_embedder'):
-            y = self.mmdit.y_embedder(c)
-            c_mod = c_mod + y
-        context = self.mmdit.context_embedder(c) if c is not None else None
-        for i, block in enumerate(self.mmdit.joint_blocks):
-            context, x = block(context, x, c=c_mod)
-            if i in self.cross_attn_layers:
-                features.append(x)
-        return features
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor, is_video: bool = False) -> torch.Tensor:
-        t = torch.rand(x.shape[0], device=x.device) * self.max_timesteps
-        shift = 12.0 if is_video else 1.0
-        t = self._shift_timestep(t, shift)
-        features = self._get_features(x, c, t)
-        cross_attn_outputs = [block(feat) for feat, block in zip(features, self.cross_attn_blocks)]
-        combined = torch.cat(cross_attn_outputs, dim=-1)
-        return self.final_proj(self.final_norm(combined))
-
-class APTGenerator(nn.Module):
-    """One-step generator from distilled MMDiT (Section 3.2)."""
-    def __init__(self, mmdit_model: MMDiTX, max_timesteps: int = 1000):
-        super().__init__()
-        self.mmdit = mmdit_model
-        self.max_timesteps = max_timesteps
-
-    def forward(self, z: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        t = torch.full((z.shape[0],), self.max_timesteps, device=z.device, dtype=torch.bfloat16)
-        v = self.mmdit(z, t, y=c)
-        return z - v
-
-class ApproximatedR1Regularization:
-    """Approximated R1 regularization (Section 3.4)."""
-    def __init__(self, sigma: float = 0.01, lambda_r1: float = 100.0):
-        self.sigma = sigma
-        self.lambda_r1 = lambda_r1
-
-    def __call__(self, discriminator: APTDiscriminator, x: torch.Tensor, c: torch.Tensor, is_video: bool) -> torch.Tensor:
-        x_perturbed = x + torch.randn_like(x, dtype=torch.bfloat16) * self.sigma
-        d_real = discriminator(x, c, is_video)
-        d_perturbed = discriminator(x_perturbed, c, is_video)
-        return self.lambda_r1 * torch.mean((d_real - d_perturbed) ** 2)
-
-class EMAModel:
-    """EMA for generator stability (Section 3.5)."""
-    def __init__(self, model: nn.Module, decay: float = 0.995):
-        self.model, self.decay = model, decay
-        self.shadow = {name: param.data.clone().detach() for name, param in model.named_parameters() if param.requires_grad}
-        self.backup = {}
-
-    def update(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
-
-    def apply_shadow(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.backup[name], param.data = param.data, self.shadow[name].clone()
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                param.data = self.backup[name].clone()
 
 # Enhanced APTTrainer
 class APTTrainer:
@@ -736,7 +655,7 @@ def train_apt(image_data_loader, video_data_loader):
             # Expected: real_samples [B, 4, 64, 64], conditions [B, 768]
             real_samples = real_samples.unsqueeze(1)  # Add time dim: [B, 1, 4, 64, 64]
             g_loss, d_loss = trainer.train_step(real_samples, conditions, is_video=False)
-            print(f"Image Epoch {epoch}, G Loss: {g_loss}, D Loss: {d_loss}")
+            logger.debug(f"Image Epoch {epoch}, G Loss: {g_loss}, D Loss: {d_loss}")
 
     # Save EMA checkpoint
     ema_checkpoint = trainer.ema.shadow.copy()
@@ -752,7 +671,7 @@ def train_apt(image_data_loader, video_data_loader):
         for real_samples, conditions in video_data_loader:
             # Expected: real_samples [B, 48, 4, 45, 80], conditions [B, 768]
             g_loss, d_loss = trainer.train_step(real_samples, conditions, is_video=True)
-            print(f"Video Epoch {epoch}, G Loss: {g_loss}, D Loss: {d_loss}")
+            logger.debug(f"Video Epoch {epoch}, G Loss: {g_loss}, D Loss: {d_loss}")
 
     return trainer
 
