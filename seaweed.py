@@ -14,6 +14,13 @@ from torch.utils.data import Dataset, DataLoader
 from safetensors import safe_open
 from typing import *
 
+Run([
+    '--load-plugins=pylint_plugin',
+    '--disable=all',  # Disable all checks first
+    '--enable=duplicate-method',  # Only enable our custom checker
+    '--ignore=venv,env,.git,.venv',  # Ignore common directories
+    '*.py'
+])
 
 class APTCrossAttentionBlock(nn.Module):
     """Modified Cross-attention block for SD3.5 architecture."""
@@ -404,8 +411,7 @@ class APTConfig:
         log_interval: int = 10,
         save_interval: int = 50,
         checkpoint_dir: str = "checkpoints",
-        self.latent_channels = 16  # SD3.5-specific
-        self.condition_dim = 4096  # SD3.5 text embedding size
+
     ):
         self.train_images = train_images
         self.train_videos = train_videos
@@ -657,25 +663,55 @@ def train_apt(image_data_loader, video_data_loader):
 
 
 
-
 def load_sd35_weights(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> dict:
+    logger.info(f"Loading SD3.5 weights from {model_path}")
     with safe_open(model_path, framework="pt", device=device) as f:
         state_dict = {k: f.get_tensor(k).to(dtype=dtype) for k in f.keys()}
     
-    # Map SD3.5 keys to Seaweed’s MMDiT structure
+    # Log basic info about the loaded weights
+    logger.info(f"Loaded {len(state_dict)} weight tensors")
+    
+    # Define expected key prefixes and sample shapes (based on SD3.5 Medium assumptions)
+    expected_mappings = {
+        "model.diffusion_model.x_embedder.proj.weight": (1024, 16, 2, 2),  # [out_channels, in_channels, patch_size, patch_size]
+        "model.diffusion_model.y_embedder.mlp.0.weight": (1152, 4096),    # [hidden_size, adm_in_channels]
+        "model.diffusion_model.joint_blocks.0.context_block.attn.qkv.weight": (3072, 1024),  # [3*hidden_size, hidden_size]
+        "model.diffusion_model.final_layer.linear.weight": (16, 1024),    # [out_channels, hidden_size]
+    }
+    
     mapped_state_dict = {}
     prefix = "model.diffusion_model."
+    missing_keys = []
+    shape_mismatches = []
+    
     for key, tensor in state_dict.items():
         if key.startswith(prefix):
             new_key = key[len(prefix):]
+            mapped_key = new_key
             if "x_embedder" in new_key:
-                mapped_state_dict[f"x_embedder.{new_key.split('x_embedder.')[-1]}"] = tensor
+                mapped_key = f"x_embedder.{new_key.split('x_embedder.')[-1]}"
             elif "y_embedder" in new_key:
-                mapped_state_dict[f"y_embedder.{new_key.split('y_embedder.')[-1]}"] = tensor
-            elif "joint_blocks" in new_key:
-                mapped_state_dict[new_key] = tensor  # Direct mapping for transformer blocks
-            elif "final_layer" in new_key:
-                mapped_state_dict[new_key] = tensor
+                mapped_key = f"y_embedder.{new_key.split('y_embedder.')[-1]}"
+            mapped_state_dict[mapped_key] = tensor
+            
+            # Validate shape for key samples
+            if key in expected_mappings:
+                expected_shape = expected_mappings[key]
+                if tuple(tensor.shape) != expected_shape:
+                    shape_mismatches.append(f"{key}: Expected {expected_shape}, got {tuple(tensor.shape)}")
+            logger.debug(f"Loaded {key} -> {mapped_key}: {tensor.shape}")
+        else:
+            missing_keys.append(key)
+    
+    # Report validation results
+    if missing_keys:
+        logger.warning(f"Keys not mapped: {len(missing_keys)} (e.g., {missing_keys[:5]})")
+    if shape_mismatches:
+        logger.error(f"Shape mismatches detected: {shape_mismatches}")
+        raise ValueError("Weight shape validation failed")
+    else:
+        logger.info("All key shapes validated successfully")
+    
     return mapped_state_dict
 
 
@@ -685,133 +721,158 @@ class APTTrainingSetup:
         self,
         model_path: str,
         device: str = "cuda",
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.bfloat16,
         learning_rate: float = 5e-6,
         ema_decay: float = 0.995
     ):
         self.device = device
         self.dtype = dtype
         
-        # Load SD3.5 model
-        print("Loading SD3.5 model...")
-        self.base_model = load_sd35_model(model_path, device)
-        self.base_model.to(dtype=dtype)
+        # Load SD3.5 weights
+        logger.info("Loading SD3.5 weights...")
+        self.sd35_weights = load_sd35_weights(model_path, device=self.device, dtype=self.dtype)
         
-        # Initialize generator
-        print("Initializing generator...")
+        # Initialize generator with SD3.5 weights
+        logger.info("Initializing generator with SD3.5 weights...")
         self.generator = APTGenerator(
-            self.base_model,
-            device=device,
-            dtype=dtype
-        )
+            sd35_weights=self.sd35_weights,
+            max_timesteps=1000,
+            device=self.device,
+            dtype=self.dtype
+        ).to(self.device, dtype=self.dtype)
         
-        # Initialize discriminator
-        print("Initializing discriminator...")
+        # Initialize discriminator with SD3.5 weights
+        logger.info("Initializing discriminator with SD3.5 weights...")
         self.discriminator = APTDiscriminator(
-            self.base_model,
-            device=device,
-            dtype=dtype
-        )
+            sd35_weights=self.sd35_weights,
+            cross_attn_layers=[16, 26, 36],  # As per Seaweed design
+            max_timesteps=1000,
+            device=self.device,
+            dtype=self.dtype
+        ).to(self.device, dtype=self.dtype)
         
         # Initialize optimizers
         self.g_optimizer = torch.optim.RMSprop(
             self.generator.parameters(),
             lr=learning_rate,
-            alpha=0.9
+            alpha=0.9,
+            eps=1e-8
         )
         self.d_optimizer = torch.optim.RMSprop(
             self.discriminator.parameters(),
             lr=learning_rate,
-            alpha=0.9
+            alpha=0.9,
+            eps=1e-8
         )
         
         # Initialize EMA
         self.ema = EMAModel(self.generator, decay=ema_decay)
         
-    def train_step(self, real_samples: torch.Tensor, conditions: torch.Tensor, is_video: bool = False, noise: Optional[torch.Tensor] = None):
-        # Move data to device
-        real_samples = real_samples.to(self.device, dtype=self.dtype)  # [B, T, 16, H, W]
-        conditions = conditions.to(self.device, dtype=self.dtype)  # [B, 4096]
+        # Validate initialization
+        self._validate_initialization()
 
-        if noise is None:
-            shape = real_samples.shape
-            noise = torch.randn(shape, device=self.device, dtype=self.dtype)
-            
+    def _validate_initialization(self):
+        """Validate that weights are correctly loaded and models are functional."""
+        # Check a few key parameters
+        for name, param in self.generator.named_parameters():
+            if "x_embedder.proj.weight" in name:
+                assert param.shape == (1024, 16, 2, 2), f"Generator x_embedder.proj.weight shape mismatch: {param.shape}"
+            elif "final_layer.linear.weight" in name:
+                assert param.shape == (16, 1024), f"Generator final_layer.linear.weight shape mismatch: {param.shape}"
+        
+        # Test forward pass with dummy input
+        batch_size = 2
+        noise = torch.randn(batch_size, 1, 16, 64, 64, device=self.device, dtype=self.dtype)
+        condition = torch.randn(batch_size, 4096, device=self.device, dtype=self.dtype)
+        
+        with torch.no_grad():
+            gen_output = self.generator(noise, condition)
+            assert gen_output.shape == (batch_size, 1, 16, 64, 64), f"Generator output shape mismatch: {gen_output.shape}"
+            disc_output = self.discriminator(noise, condition, is_video=False)
+            assert disc_output.shape == (batch_size, 1), f"Discriminator output shape mismatch: {disc_output.shape}"
+        
+        logger.info("Initialization validated successfully")
+
+    def train_step(
+        self,
+        real_samples: torch.Tensor,
+        conditions: torch.Tensor,
+        is_video: bool = False
+    ) -> dict[str, float]:
+        """Single training step with SD3.5-compatible inputs."""
+        real_samples = real_samples.to(self.device, dtype=self.dtype)  # [B, T, 16, H, W]
+        conditions = conditions.to(self.device, dtype=self.dtype)    # [B, 4096]
+        
         # Train discriminator
         self.d_optimizer.zero_grad()
         with torch.cuda.amp.autocast(dtype=self.dtype):
-            # Generate fake samples
             noise = torch.randn_like(real_samples)
             fake_samples = self.generator(noise, conditions)
             
-            # Get discriminator outputs
             d_real = self.discriminator(real_samples, conditions, is_video)
             d_fake = self.discriminator(fake_samples.detach(), conditions, is_video)
             
-            # Calculate discriminator loss
-            d_loss = -(torch.mean(F.logsigmoid(d_real)) + 
-                      torch.mean(F.logsigmoid(-d_fake)))
-            
+            d_loss = -(torch.mean(F.logsigmoid(d_real)) + torch.mean(F.logsigmoid(-d_fake)))
+        
         d_loss.backward()
         self.d_optimizer.step()
         
         # Train generator
         self.g_optimizer.zero_grad()
         with torch.cuda.amp.autocast(dtype=self.dtype):
-            # Generate new fake samples
             noise = torch.randn_like(real_samples)
             fake_samples = self.generator(noise, conditions)
-            
-            # Get discriminator output for fake samples
             d_fake = self.discriminator(fake_samples, conditions, is_video)
-            
-            # Calculate generator loss
             g_loss = -torch.mean(F.logsigmoid(d_fake))
-            
+        
         g_loss.backward()
         self.g_optimizer.step()
         
         # Update EMA
         self.ema.update()
         
-        return {
-            "g_loss": g_loss.item(),
-            "d_loss": d_loss.item()
-        }
-        
+        return {"g_loss": g_loss.item(), "d_loss": d_loss.item()}
+
     @torch.no_grad()
     def generate_samples(
         self,
         conditions: torch.Tensor,
         num_samples: int = 1,
-        use_ema: bool = True
+        use_ema: bool = True,
+        is_video: bool = False
     ) -> torch.Tensor:
+        """Generate samples with SD3.5-compatible latent dimensions."""
         if use_ema:
             self.ema.apply_shadow()
-            
+        
         conditions = conditions.to(self.device, dtype=self.dtype)
+        h, w = (64, 64) if not is_video else (45, 80)
+        t = 1 if not is_video else 48
         noise = torch.randn(
-            num_samples, 4, 64, 64,  # Latent space dimensions
+            num_samples, t, 16, h, w,
             device=self.device,
             dtype=self.dtype
         )
         
-        samples = self.generator(noise, conditions)
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            samples = self.generator(noise, conditions)
         
         if use_ema:
             self.ema.restore()
-            
+        
         return samples
 
 # Example usage
 def main():
     model_path = "./models/sd3.5_medium.safetensors"
     
-    # Initialize training setup
+    # Initialize training setup with SD3.5 weights
     trainer = APTTrainingSetup(
         model_path=model_path,
         device="cuda",
-        dtype=torch.float16
+        dtype=torch.bfloat16,
+        learning_rate=5e-6,
+        ema_decay=0.995
     )
     
     # Example training loop
