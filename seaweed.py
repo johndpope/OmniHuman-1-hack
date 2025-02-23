@@ -14,14 +14,6 @@ from torch.utils.data import Dataset, DataLoader
 from safetensors import safe_open
 from typing import *
 
-Run([
-    '--load-plugins=pylint_plugin',
-    '--disable=all',  # Disable all checks first
-    '--enable=duplicate-method',  # Only enable our custom checker
-    '--ignore=venv,env,.git,.venv',  # Ignore common directories
-    '*.py'
-])
-
 class APTCrossAttentionBlock(nn.Module):
     """Modified Cross-attention block for SD3.5 architecture."""
     def __init__(self, hidden_size: int, num_heads: int, device=None, dtype=None):
@@ -245,145 +237,6 @@ class EMAModel:
 
 
 
-# Enhanced APTTrainer
-class APTTrainer:
-    """Trainer for Adversarial Post-Training (APT) with distributed support (Sections 3.1, 3.5)."""
-    def __init__(
-        self,
-        generator: APTGenerator,
-        discriminator: APTDiscriminator,
-        r1_reg: ApproximatedR1Regularization,
-        learning_rate: float,
-        config: 'APTConfig',
-        ema_decay: float = 0.995,
-    ):
-        self.config = config
-        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-        self.dtype = config.dtype
-
-        # Move models to device and cast to dtype
-        self.generator = generator.to(self.device, dtype=self.dtype)
-        self.discriminator = discriminator.to(self.device, dtype=self.dtype)
-        self.r1_reg = r1_reg
-
-        # Optimizers with RMSProp as per Section 3.5
-        self.g_optimizer = torch.optim.RMSprop(
-            self.generator.parameters(),
-            lr=learning_rate,
-            alpha=0.9,  # Equivalent to Adam beta2=0.9
-            eps=1e-8,
-        )
-        self.d_optimizer = torch.optim.RMSprop(
-            self.discriminator.parameters(),
-            lr=learning_rate,
-            alpha=0.9,
-            eps=1e-8,
-        )
-
-        # EMA for generator stability
-        self.ema = EMAModel(self.generator, decay=ema_decay)
-
-        # Distributed training setup
-        self.is_distributed = config.world_size > 1
-        if self.is_distributed:
-            self.generator = DDP(self.generator, device_ids=[config.local_rank])
-            self.discriminator = DDP(self.discriminator, device_ids=[config.local_rank])
-
-    def set_learning_rate(self, lr: float):
-        """Update learning rate dynamically (e.g., for phase transitions)."""
-        for param_group in self.g_optimizer.param_groups:
-            param_group['lr'] = lr
-        for param_group in self.d_optimizer.param_groups:
-            param_group['lr'] = lr
-
-    def set_r1_sigma(self, sigma: float):
-        """Update R1 regularization sigma (e.g., image vs. video phase)."""
-        self.r1_reg.sigma = sigma
-
-    def train_step(
-        self,
-        real_samples: torch.Tensor,
-        conditions: torch.Tensor,
-        is_video: bool = False,
-        noise: Optional[torch.Tensor] = None,
-    ) -> Tuple[float, float, float]:
-        """Single training step with detailed loss computation (Section 3.1)."""
-        real_samples = real_samples.to(self.device, dtype=self.dtype)
-        conditions = conditions.to(self.device, dtype=self.dtype)
-
-        # Generate noise if not provided
-        if noise is None:
-            shape = real_samples.shape  # [B, T, C, H, W] where T=1 for images, 48 for videos
-            noise = torch.randn(shape, device=self.device, dtype=self.dtype)
-
-        # Discriminator step
-        self.d_optimizer.zero_grad()
-        with torch.cuda.amp.autocast(dtype=self.dtype):
-            fake_samples = self.generator(noise, conditions)
-            d_real = self.discriminator(real_samples, conditions, is_video)
-            d_fake = self.discriminator(fake_samples.detach(), conditions, is_video)
-            d_loss = -(torch.mean(F.logsigmoid(d_real)) + torch.mean(F.logsigmoid(-d_fake)))
-            r1_loss = self.r1_reg(self.discriminator, real_samples, conditions, is_video)
-            d_total_loss = d_loss + r1_loss
-
-        d_total_loss.backward()
-        if self.is_distributed:
-            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
-        self.d_optimizer.step()
-
-        # Generator step
-        self.g_optimizer.zero_grad()
-        with torch.cuda.amp.autocast(dtype=self.dtype):
-            fake_samples = self.generator(noise, conditions)
-            d_fake = self.discriminator(fake_samples, conditions, is_video)
-            g_loss = -torch.mean(F.logsigmoid(d_fake))
-
-        g_loss.backward()
-        if self.is_distributed:
-            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-        self.g_optimizer.step()
-        self.ema.update()
-
-        # Synchronize losses across GPUs if distributed
-        if self.is_distributed:
-            losses = [g_loss.clone(), d_loss.clone(), r1_loss.clone()]
-            for loss in losses:
-                dist.all_reduce(loss)
-                loss /= self.config.world_size
-            g_loss, d_loss, r1_loss = [loss.item() for loss in losses]
-        else:
-            g_loss, d_loss, r1_loss = g_loss.item(), d_loss.item(), r1_loss.item()
-
-        return g_loss, d_loss, r1_loss
-
-    @torch.no_grad()
-    def sample(
-        self,
-        conditions: torch.Tensor,
-        noise: Optional[torch.Tensor] = None,
-        use_ema: bool = True,
-        is_video: bool = False,
-    ) -> torch.Tensor:
-        """Generate samples with proper shape handling (Section 3.5)."""
-        conditions = conditions.to(self.device, dtype=self.dtype)
-        if use_ema:
-            self.ema.apply_shadow()
-
-        if noise is None:
-            # Adjust shape based on image or video mode
-            h, w = (64, 64) if not is_video else (45, 80)  # Latent sizes from paper
-            t = 1 if not is_video else 48  # 1 frame for images, 48 for 2s@24fps videos
-            shape = (conditions.shape[0], t, self.generator.mmdit.in_channels, h, w)
-            noise = torch.randn(shape, device=self.device, dtype=self.dtype)
-
-        with torch.cuda.amp.autocast(dtype=self.dtype):
-            samples = self.generator(noise, conditions)
-
-        if use_ema:
-            self.ema.restore()
-        return samples
-
-
 
 class APTConfig:
     def __init__(
@@ -535,46 +388,8 @@ class APTTrainingLoop:
         self.train_images()
         self.train_videos()
 
-def setup_apt_training(
-    mmdit_model: nn.Module,
-    config: APTConfig,
-    image_dataloader: Optional[DataLoader] = None,
-    video_dataloader: Optional[DataLoader] = None
-) -> APTTrainingLoop:
-    """Setup APT training components."""
-    
-    # Initialize generator and discriminator
-    generator = APTGenerator(mmdit_model)
-    discriminator = APTDiscriminator(
-        mmdit_model,
-        device=config.device,
-        dtype=config.dtype
-    )
-    
-    # Initialize R1 regularization
-    r1_reg = ApproximatedR1Regularization(
-        sigma=config.image_r1_sigma,
-        lambda_r1=config.r1_lambda
-    )
-    
-    # Create trainer
-    trainer = APTTrainer(
-        generator=generator,
-        discriminator=discriminator,
-        r1_reg=r1_reg,
-        learning_rate=config.image_learning_rate,
-        ema_decay=config.ema_decay
-    )
-    
-    # Create training loop
-    training_loop = APTTrainingLoop(
-        config=config,
-        trainer=trainer,
-        image_dataloader=image_dataloader,
-        video_dataloader=video_dataloader
-    )
-    
-    return training_loop
+
+
 
 
 def initialize_models(pretrained_mmdit: MMDiTX, max_timesteps: int = 1000):
@@ -716,17 +531,19 @@ def load_sd35_weights(model_path: str, device: str = "cuda", dtype: torch.dtype 
 
 
     
-class APTTrainingSetup:
+
+
+class SeaweedTrainer:
     def __init__(
         self,
         model_path: str,
-        device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
-        learning_rate: float = 5e-6,
-        ema_decay: float = 0.995
+        config: APTConfig,
+        image_dataloader: Optional[torch.utils.data.DataLoader] = None,
+        video_dataloader: Optional[torch.utils.data.DataLoader] = None,
     ):
-        self.device = device
-        self.dtype = dtype
+        self.config = config
+        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        self.dtype = config.dtype
         
         # Load SD3.5 weights
         logger.info("Loading SD3.5 weights...")
@@ -745,42 +562,56 @@ class APTTrainingSetup:
         logger.info("Initializing discriminator with SD3.5 weights...")
         self.discriminator = APTDiscriminator(
             sd35_weights=self.sd35_weights,
-            cross_attn_layers=[16, 26, 36],  # As per Seaweed design
+            cross_attn_layers=[16, 26, 36],  # Seaweed design
             max_timesteps=1000,
             device=self.device,
             dtype=self.dtype
         ).to(self.device, dtype=self.dtype)
         
-        # Initialize optimizers
+        # Initialize R1 regularization
+        self.r1_reg = ApproximatedR1Regularization(
+            sigma=self.config.image_r1_sigma,
+            lambda_r1=self.config.r1_lambda
+        )
+        
+        # Optimizers with RMSProp as per Section 3.5
         self.g_optimizer = torch.optim.RMSprop(
             self.generator.parameters(),
-            lr=learning_rate,
+            lr=self.config.image_learning_rate,
             alpha=0.9,
             eps=1e-8
         )
         self.d_optimizer = torch.optim.RMSprop(
             self.discriminator.parameters(),
-            lr=learning_rate,
+            lr=self.config.image_learning_rate,
             alpha=0.9,
             eps=1e-8
         )
         
-        # Initialize EMA
-        self.ema = EMAModel(self.generator, decay=ema_decay)
+        # EMA for generator stability
+        self.ema = EMAModel(self.generator, decay=self.config.ema_decay)
+        
+        # Distributed training setup
+        self.is_distributed = self.config.world_size > 1
+        if self.is_distributed:
+            dist.init_process_group("nccl")
+            torch.cuda.set_device(self.config.local_rank)
+            self.generator = DDP(self.generator, device_ids=[self.config.local_rank])
+            self.discriminator = DDP(self.discriminator, device_ids=[self.config.local_rank])
+        
+        # Logger and Checkpointer
+        self.logger = APTLogger(self.config)
+        self.checkpointer = APTCheckpointer(self.config)
+        
+        # Data loaders
+        self.image_dataloader = image_dataloader
+        self.video_dataloader = video_dataloader
         
         # Validate initialization
         self._validate_initialization()
 
     def _validate_initialization(self):
         """Validate that weights are correctly loaded and models are functional."""
-        # Check a few key parameters
-        for name, param in self.generator.named_parameters():
-            if "x_embedder.proj.weight" in name:
-                assert param.shape == (1024, 16, 2, 2), f"Generator x_embedder.proj.weight shape mismatch: {param.shape}"
-            elif "final_layer.linear.weight" in name:
-                assert param.shape == (16, 1024), f"Generator final_layer.linear.weight shape mismatch: {param.shape}"
-        
-        # Test forward pass with dummy input
         batch_size = 2
         noise = torch.randn(batch_size, 1, 16, 64, 64, device=self.device, dtype=self.dtype)
         condition = torch.randn(batch_size, 4096, device=self.device, dtype=self.dtype)
@@ -790,48 +621,72 @@ class APTTrainingSetup:
             assert gen_output.shape == (batch_size, 1, 16, 64, 64), f"Generator output shape mismatch: {gen_output.shape}"
             disc_output = self.discriminator(noise, condition, is_video=False)
             assert disc_output.shape == (batch_size, 1), f"Discriminator output shape mismatch: {disc_output.shape}"
-        
         logger.info("Initialization validated successfully")
+
+    def set_learning_rate(self, lr: float):
+        """Update learning rate dynamically (e.g., for phase transitions)."""
+        for param_group in self.g_optimizer.param_groups:
+            param_group['lr'] = lr
+        for param_group in self.d_optimizer.param_groups:
+            param_group['lr'] = lr
+
+    def set_r1_sigma(self, sigma: float):
+        """Update R1 regularization sigma (e.g., image vs. video phase)."""
+        self.r1_reg.sigma = sigma
 
     def train_step(
         self,
         real_samples: torch.Tensor,
         conditions: torch.Tensor,
-        is_video: bool = False
-    ) -> dict[str, float]:
-        """Single training step with SD3.5-compatible inputs."""
+        is_video: bool = False,
+        noise: Optional[torch.Tensor] = None
+    ) -> Dict[str, float]:
+        """Single training step with detailed loss computation (Section 3.1)."""
         real_samples = real_samples.to(self.device, dtype=self.dtype)  # [B, T, 16, H, W]
-        conditions = conditions.to(self.device, dtype=self.dtype)    # [B, 4096]
+        conditions = conditions.to(self.device, dtype=self.dtype)      # [B, 4096]
         
-        # Train discriminator
+        if noise is None:
+            noise = torch.randn_like(real_samples, device=self.device, dtype=self.dtype)
+        
+        # Discriminator step
         self.d_optimizer.zero_grad()
         with torch.cuda.amp.autocast(dtype=self.dtype):
-            noise = torch.randn_like(real_samples)
             fake_samples = self.generator(noise, conditions)
-            
             d_real = self.discriminator(real_samples, conditions, is_video)
             d_fake = self.discriminator(fake_samples.detach(), conditions, is_video)
-            
             d_loss = -(torch.mean(F.logsigmoid(d_real)) + torch.mean(F.logsigmoid(-d_fake)))
+            r1_loss = self.r1_reg(self.discriminator, real_samples, conditions, is_video)
+            d_total_loss = d_loss + r1_loss
         
-        d_loss.backward()
+        d_total_loss.backward()
+        if self.is_distributed:
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
         self.d_optimizer.step()
         
-        # Train generator
+        # Generator step
         self.g_optimizer.zero_grad()
         with torch.cuda.amp.autocast(dtype=self.dtype):
-            noise = torch.randn_like(real_samples)
             fake_samples = self.generator(noise, conditions)
             d_fake = self.discriminator(fake_samples, conditions, is_video)
             g_loss = -torch.mean(F.logsigmoid(d_fake))
         
         g_loss.backward()
+        if self.is_distributed:
+            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
         self.g_optimizer.step()
-        
-        # Update EMA
         self.ema.update()
         
-        return {"g_loss": g_loss.item(), "d_loss": d_loss.item()}
+        # Synchronize losses if distributed
+        if self.is_distributed:
+            losses = [g_loss.clone(), d_loss.clone(), r1_loss.clone()]
+            for loss in losses:
+                dist.all_reduce(loss)
+                loss /= self.config.world_size
+            g_loss, d_loss, r1_loss = [loss.item() for loss in losses]
+        else:
+            g_loss, d_loss, r1_loss = g_loss.item(), d_loss.item(), r1_loss.item()
+        
+        return {"g_loss": g_loss, "d_loss": d_loss, "r1_loss": r1_loss}
 
     @torch.no_grad()
     def generate_samples(
@@ -841,7 +696,7 @@ class APTTrainingSetup:
         use_ema: bool = True,
         is_video: bool = False
     ) -> torch.Tensor:
-        """Generate samples with SD3.5-compatible latent dimensions."""
+        """Generate samples with SD3.5-compatible latent dimensions (Section 3.5)."""
         if use_ema:
             self.ema.apply_shadow()
         
@@ -859,97 +714,91 @@ class APTTrainingSetup:
         
         if use_ema:
             self.ema.restore()
-        
         return samples
+
+    def train_images(self):
+        """Train on images as per Section 3.5."""
+        if not self.config.train_images or self.image_dataloader is None:
+            return
+        self.logger.reset_metrics()
+        self.set_learning_rate(self.config.image_learning_rate)
+        self.set_r1_sigma(self.config.image_r1_sigma)
+        iterator = iter(self.image_dataloader)
+        
+        for step in tqdm(range(self.config.image_updates), disable=self.config.local_rank != 0):
+            try:
+                real_images, conditions = next(iterator)
+            except StopIteration:
+                iterator = iter(self.image_dataloader)
+                real_images, conditions = next(iterator)
+            real_images = real_images.unsqueeze(1)  # [B, 1, 16, H, W]
+            g_loss, d_loss, r1_loss = self.train_step(real_images, conditions, is_video=False)
+            self.logger.log_metrics(g_loss, d_loss, r1_loss, step, "Image")
+            if (step + 1) % self.config.save_interval == 0:
+                self.checkpointer.save_checkpoint(self, step, "image")
+        self.checkpointer.save_checkpoint(self, self.config.image_updates, "image", is_final=True)
+
+    def train_videos(self):
+        """Train on videos as per Section 3.5."""
+        if not self.config.train_videos or self.video_dataloader is None:
+            return
+        self.logger.reset_metrics()
+        self.set_learning_rate(self.config.video_learning_rate)
+        self.set_r1_sigma(self.config.video_r1_sigma)
+        iterator = iter(self.video_dataloader)
+        
+        for step in tqdm(range(self.config.video_updates), disable=self.config.local_rank != 0):
+            try:
+                real_videos, conditions = next(iterator)
+            except StopIteration:
+                iterator = iter(self.video_dataloader)
+                real_videos, conditions = next(iterator)
+            g_loss, d_loss, r1_loss = self.train_step(real_videos, conditions, is_video=True)
+            self.logger.log_metrics(g_loss, d_loss, r1_loss, step, "Video")
+            if (step + 1) % self.config.save_interval == 0:
+                self.checkpointer.save_checkpoint(self, step, "video")
+        self.checkpointer.save_checkpoint(self, self.config.video_updates, "video", is_final=True)
+
+    def train(self):
+        """Execute full two-phase training."""
+        self.train_images()
+        self.train_videos()
 
 # Example usage
 def main():
-    model_path = "./models/sd3.5_medium.safetensors"
-    
-    # Initialize training setup with SD3.5 weights
-    trainer = APTTrainingSetup(
-        model_path=model_path,
+    config = APTConfig(
+        train_images=True,
+        train_videos=True,
+        image_batch_size=8,
+        video_batch_size=8,
+        world_size=1,
+        local_rank=0,
         device="cuda",
-        dtype=torch.bfloat16,
-        learning_rate=5e-6,
-        ema_decay=0.995
+        dtype=torch.bfloat16
     )
     
-    # Example training loop
-    for epoch in range(350):  # As per paper specifications
-        # Your dataloader iteration here
-        real_samples = torch.randn(8, 4, 64, 64)  # Example batch
-        conditions = torch.randn(8, 768)  # Example CLIP embeddings
-        
-        losses = trainer.train_step(real_samples, conditions)
-        
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}")
-            print(f"Generator loss: {losses['g_loss']:.4f}")
-            print(f"Discriminator loss: {losses['d_loss']:.4f}")
-            
-        if epoch % 50 == 0:
-            # Generate samples
-            samples = trainer.generate_samples(conditions[:1], num_samples=1)
-            # Save or process samples as needed
+    # Dummy datasets
+    class DummyDataset(torch.utils.data.Dataset):
+        def __init__(self, is_video=False):
+            self.is_video = is_video
+        def __len__(self):
+            return 100
+        def __getitem__(self, idx):
+            if self.is_video:
+                return torch.randn(48, 16, 45, 80), torch.randn(4096)  # Video latents
+            return torch.randn(16, 64, 64), torch.randn(4096)      # Image latents
+    
+    image_loader = torch.utils.data.DataLoader(DummyDataset(is_video=False), batch_size=config.image_batch_size)
+    video_loader = torch.utils.data.DataLoader(DummyDataset(is_video=True), batch_size=config.video_batch_size)
+    
+    trainer = SeaweedTrainer(
+        model_path="./models/sd3.5_medium.safetensors",
+        config=config,
+        image_dataloader=image_loader,
+        video_dataloader=video_loader
+    )
+    
+    trainer.train()
 
 if __name__ == "__main__":
     main()
-             
-
-
-
-# # Example usage
-# if __name__ == "__main__":
-#     # Configuration
-#     config = APTConfig(
-#         world_size=int(os.environ.get("WORLD_SIZE", 1)),
-#         local_rank=int(os.environ.get("LOCAL_RANK", 0)),
-#     )
-
-#     # Placeholder MMDiT model (pre-trained assumed)
-#     mmdit_model = MMDiTX(
-#         input_size=None,
-#         patch_size=2,
-#         in_channels=4,
-#         depth=36,
-#         mlp_ratio=4.0,
-#         learn_sigma=False,
-#         adm_in_channels=768,
-#         context_embedder_config={"target": "torch.nn.Linear", "params": {"in_features": 768, "out_features": 1152}},
-#         out_channels=4,
-#         pos_embed_max_size=64,
-#         num_patches=4096,
-#         dtype=config.dtype,
-#         device=config.device,
-#         verbose=True,
-#     )
-#     # Adjust hidden_size as before (placeholder adjustment)
-#     mmdit_model.x_embedder.proj = nn.Conv2d(4, 1152, kernel_size=2, stride=2, bias=True, dtype=config.dtype, device=config.device)
-#     for block in mmdit_model.joint_blocks:
-#         block.context_block.attn.qkv = nn.Linear(1152, 1152 * 3, bias=True, dtype=config.dtype, device=config.device)
-#         block.context_block.attn.proj = nn.Linear(1152, 1152, dtype=config.dtype, device=config.device)
-#         block.x_block.attn.qkv = nn.Linear(1152, 1152 * 3, bias=True, dtype=config.dtype, device=config.device)
-#         block.x_block.attn.proj = nn.Linear(1152, 1152, dtype=config.dtype, device=config.device)
-#         block.x_block.mlp.fc1 = nn.Linear(1152, int(1152 * 4), dtype=config.dtype, device=config.device)
-#         block.x_block.mlp.fc2 = nn.Linear(int(1152 * 4), 1152, dtype=config.dtype, device=config.device)
-#     mmdit_model.final_layer.linear = nn.Linear(1152, 2 * 2 * 4, bias=True, dtype=config.dtype, device=config.device)
-#     mmdit_model.final_layer.adaLN_modulation[-1] = nn.Linear(1152, 2 * 1152, bias=True, dtype=config.dtype, device=config.device)
-
-
-#     class DummyDataset(Dataset):
-#         def __init__(self, is_video=False):
-#             self.is_video = is_video
-#         def __len__(self):
-#             return 1000
-#         def __getitem__(self, idx):
-#             if self.is_video:
-#                 return torch.randn(48, 4, 45, 80), torch.randn(768)  # Video latents
-#             return torch.randn(4, 64, 64), torch.randn(768)  # Image latents
-
-#     image_loader = DataLoader(DummyDataset(is_video=False), batch_size=config.image_batch_size // config.world_size, shuffle=True)
-#     video_loader = DataLoader(DummyDataset(is_video=True), batch_size=config.video_batch_size // config.world_size, shuffle=True)
-
-#     # Setup and run training
-#     training_loop = setup_apt_training(mmdit_model, config, image_loader, video_loader)
-#     training_loop.train()

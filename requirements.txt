@@ -12,3 +12,4 @@ protobuf
 webdataset
 pylint
 rich
+difflib
