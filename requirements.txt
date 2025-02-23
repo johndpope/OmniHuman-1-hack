@@ -11,3 +11,4 @@ sentencepiece
 protobuf
 webdataset
 pylint
+rich

@@ -4,6 +4,14 @@
 
 currently getting the stage 0 - seaweed to train....
 all this code derives from SD3.5 which has the multimodal diffusion transfomer MMDitX ( is this still relevant??)
+got wire up the SD3.5 weights to load
+
+```shell
+pip install -r requirements.txt
+# you need to agree to ts and cs
+git clone https://huggingface.co/stabilityai/stable-diffusion-3.5-medium models
+python seaweed.py
+```
 
 
 

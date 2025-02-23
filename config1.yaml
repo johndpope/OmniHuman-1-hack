@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+
+training:
+  train_images: true
+  train_videos: true
+  image_batch_size: 9062
+  video_batch_size: 2048
+  image_learning_rate: 5e-6
+  video_learning_rate: 3e-6
+  ema_decay: 0.995
+  image_r1_sigma: 0.01
+  video_r1_sigma: 0.1
+  r1_lambda: 100.0
+  image_updates: 350
+  video_updates: 300
+
+data:
+  image_size: 1024
+  video_width: 1280
+  video_height: 720
+  video_frames: 48  # 2 seconds at 24fps
+
+hardware:
+  device: "cuda"
+  dtype: "bfloat16"
+
+logging:
+  log_interval: 10
+  save_interval: 50
+  checkpoint_dir: "checkpoints"

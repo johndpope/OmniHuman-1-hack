@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
 from mmditx import MMDiTX, DismantledBlock, PatchEmbed, TimestepEmbedder, VectorEmbedder
 from pylint.lint import Run
 from logger import logger
@@ -11,97 +10,131 @@ import os
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from safetensors import safe_open
+from typing import *
 
 
 class APTCrossAttentionBlock(nn.Module):
-    """Cross-attention block used in APT discriminator."""
+    """Modified Cross-attention block for SD3.5 architecture."""
     def __init__(self, hidden_size: int, num_heads: int, device=None, dtype=None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         
-        # Learnable token that will attend to visual features 
         self.learnable_token = nn.Parameter(
             torch.randn(1, 1, hidden_size, dtype=dtype, device=device)
         )
         
-        # Attention components
-        self.norm = nn.LayerNorm(hidden_size, dtype=dtype, device=device)
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True, dtype=dtype, device=device)
+        # Modified for SD3.5 compatibility
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-6, dtype=dtype, device=device)
+        self.to_q = nn.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device=device)
+        self.to_k = nn.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device=device)
+        self.to_v = nn.Linear(hidden_size, hidden_size, bias=True, dtype=dtype, device=device)
         self.proj = nn.Linear(hidden_size, hidden_size, dtype=dtype, device=device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         
-        # Expand learnable token to batch size
         token = self.learnable_token.expand(B, -1, -1)
         
-        # Apply normalization
         x = self.norm(x)
         token = self.norm(token)
         
-        # Get Q from token, K/V from input features
-        q = self.qkv(token)[:, :, :self.hidden_size]
-        k = self.qkv(x)[:, :, self.hidden_size:2*self.hidden_size]
-        v = self.qkv(x)[:, :, 2*self.hidden_size:]
+        q = self.to_q(token)
+        k = self.to_k(x)
+        v = self.to_v(x)
         
-        # Reshape for attention
         q = q.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Compute scaled dot-product attention
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
         attn = F.softmax(attn, dim=-1)
         
-        # Apply attention and reshape
         x = (attn @ v).transpose(1, 2).reshape(B, -1, self.hidden_size)
         x = self.proj(x)
         
         return x
 
 class APTDiscriminator(nn.Module):
-    """Discriminator using MMDiT backbone with modifications (Section 3.3)."""
-    def __init__(
-        self,
-        mmdit_model: MMDiTX,
-        cross_attn_layers: List[int] = [16, 26, 36],  # Paper-specified layers
-        max_timesteps: int = 1000,  # Adjust based on pre-trained model
-        device=None,
-        dtype=torch.bfloat16  # Use BF16 as per Section 3.5
-    ):
+    """Modified Discriminator for SD3.5 architecture."""
+    def __init__(self, sd35_weights: dict, cross_attn_layers=[16, 26, 36], max_timesteps=1000, device="cuda", dtype=torch.bfloat16):
         super().__init__()
-        self.mmdit = mmdit_model
-        self.hidden_size = mmdit_model.diffusion_model.hidden_size
+        self.model = MMDiTX(
+            input_size=None,
+            patch_size=2,
+            in_channels=16,
+            depth=32,
+            mlp_ratio=4.0,
+            learn_sigma=False,
+            adm_in_channels=4096,
+            context_embedder_config={"target": "torch.nn.Linear", "params": {"in_features": 4096, "out_features": 1152}},
+            out_channels=16,
+            pos_embed_max_size=64,
+            num_patches=4096,
+            qk_norm=None,
+            x_block_self_attn_layers=[],
+            dtype=dtype,
+            device=device,
+            verbose=True
+        )
+        
+        # Get hidden size from model config or default to SD3.5 size
+        self.hidden_size = getattr(model, 'config', {}).get('hidden_size', 1024)
+        self.num_heads = getattr(model, 'config', {}).get('num_attention_heads', 16)
         self.max_timesteps = max_timesteps
         
         self.cross_attn_blocks = nn.ModuleList([
-            APTCrossAttentionBlock(self.hidden_size, mmdit_model.num_heads, device, dtype)
+            APTCrossAttentionBlock(
+                self.hidden_size, 
+                self.num_heads,
+                device,
+                dtype
+            )
             for _ in cross_attn_layers
         ])
         self.cross_attn_layers = cross_attn_layers
         
-        self.final_norm = nn.LayerNorm(self.hidden_size * len(cross_attn_layers), dtype=dtype, device=device)
-        self.final_proj = nn.Linear(self.hidden_size * len(cross_attn_layers), 1, dtype=dtype, device=device)
+        self.final_norm = nn.LayerNorm(
+            self.hidden_size * len(cross_attn_layers),
+            eps=1e-6,
+            dtype=dtype,
+            device=device
+        )
+        self.final_proj = nn.Linear(
+            self.hidden_size * len(cross_attn_layers),
+            1,
+            dtype=dtype,
+            device=device
+        )
 
     def _shift_timestep(self, t: torch.Tensor, shift: float) -> torch.Tensor:
-        """Timestep shifting (Section 3.3, Equation 7)."""
+        """Timestep shifting with SD3.5 compatibility."""
         return shift * t / (1 + (shift - 1) * t)
 
     def _get_features(self, x: torch.Tensor, c: torch.Tensor, t: torch.Tensor) -> List[torch.Tensor]:
-        # Adjusted for provided MMDiTX structure
         features = []
-        x = self.mmdit.x_embedder(x.squeeze(1) if x.dim() == 5 else x)  # Handle video/image input
-        c_mod = self.mmdit.t_embedder(t, dtype=x.dtype)
-        if c is not None and hasattr(self.mmdit, 'y_embedder'):
-            y = self.mmdit.y_embedder(c)
-            c_mod = c_mod + y
-        context = self.mmdit.context_embedder(c) if c is not None else None
-        for i, block in enumerate(self.mmdit.joint_blocks):
-            context, x = block(context, x, c=c_mod)
+        
+        # Modified for SD3.5 feature extraction
+        x = self.model.get_input_embeddings()(x)
+        
+        # Handle conditioning
+        c_emb = self.model.get_text_embeddings(c) if c is not None else None
+        t_emb = self.model.get_time_embeddings(t)
+        
+        # Combine embeddings
+        hidden_states = x
+        for i, block in enumerate(self.model.blocks):
+            hidden_states = block(
+                hidden_states,
+                c_emb,
+                t_emb
+            )
             if i in self.cross_attn_layers:
-                features.append(x)
+                features.append(hidden_states)
+                
         return features
 
     def forward(self, x: torch.Tensor, c: torch.Tensor, is_video: bool = False) -> torch.Tensor:
@@ -111,7 +144,9 @@ class APTDiscriminator(nn.Module):
         t = self._shift_timestep(t, shift)
         
         features = self._get_features(x, c, t)
-        cross_attn_outputs = [block(feat) for feat, block in zip(features, self.cross_attn_blocks)]
+        cross_attn_outputs = [
+            block(feat) for feat, block in zip(features, self.cross_attn_blocks)
+        ]
         
         combined = torch.cat(cross_attn_outputs, dim=-1)
         combined = self.final_norm(combined)
@@ -119,10 +154,41 @@ class APTDiscriminator(nn.Module):
     
 
 class APTGenerator(nn.Module):
-    """One-step generator from distilled MMDiT (Section 3.2)."""
-    def __init__(self, mmdit_model: MMDiTX, max_timesteps: int = 1000):
+    def __init__(self, sd35_weights: dict, max_timesteps: int = 1000, device="cuda", dtype=torch.bfloat16):
         super().__init__()
-        self.mmdit = mmdit_model
+        # Initialize MMDiT matching SD3.5 structure
+        self.mmdit = MMDiTX(
+            input_size=None,
+            patch_size=2,  # From SD3.5 weights
+            in_channels=16,  # SD3.5 latent channels
+            depth=32,  # Adjust to SD3.5 Medium’s layer count
+            mlp_ratio=4.0,
+            learn_sigma=False,
+            adm_in_channels=4096,  # Padded CLIP+T5 embedding size
+            context_embedder_config={"target": "torch.nn.Linear", "params": {"in_features": 4096, "out_features": 1152}},
+            out_channels=16,
+            pos_embed_max_size=64,
+            num_patches=4096,
+            qk_norm=None,
+            x_block_self_attn_layers=[],
+            dtype=dtype,
+            device=device,
+            verbose=True
+        )
+        # Adjust hidden_size to match SD3.5 (e.g., 1024)
+        self.mmdit.x_embedder.proj = nn.Conv2d(16, 1024, kernel_size=2, stride=2, bias=True, dtype=dtype, device=device)
+        for block in self.mmdit.joint_blocks:
+            block.context_block.attn.qkv = nn.Linear(1024, 1024 * 3, bias=True, dtype=dtype, device=device)
+            block.context_block.attn.proj = nn.Linear(1024, 1024, dtype=dtype, device=device)
+            block.x_block.attn.qkv = nn.Linear(1024, 1024 * 3, bias=True, dtype=dtype, device=device)
+            block.x_block.attn.proj = nn.Linear(1024, 1024, dtype=dtype, device=device)
+            block.x_block.mlp.fc1 = nn.Linear(1024, 1024 * 4, dtype=dtype, device=device)
+            block.x_block.mlp.fc2 = nn.Linear(1024 * 4, 1024, dtype=dtype, device=device)
+        self.mmdit.final_layer.linear = nn.Linear(1024, 16, bias=True, dtype=dtype, device=device)
+        self.mmdit.final_layer.adaLN_modulation[-1] = nn.Linear(1024, 2 * 1024, bias=True, dtype=dtype, device=device)
+        
+        # Load SD3.5 weights
+        self.mmdit.load_state_dict(sd35_weights, strict=False)
         self.max_timesteps = max_timesteps
         
     def forward(self, z: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -310,7 +376,8 @@ class APTTrainer:
             self.ema.restore()
         return samples
 
-# Supporting classes from your addition
+
+
 class APTConfig:
     def __init__(
         self,
@@ -337,6 +404,8 @@ class APTConfig:
         log_interval: int = 10,
         save_interval: int = 50,
         checkpoint_dir: str = "checkpoints",
+        self.latent_channels = 16  # SD3.5-specific
+        self.condition_dim = 4096  # SD3.5 text embedding size
     ):
         self.train_images = train_images
         self.train_videos = train_videos
@@ -502,63 +571,6 @@ def setup_apt_training(
     return training_loop
 
 
-# Example usage
-if __name__ == "__main__":
-    # Configuration
-    config = APTConfig(
-        world_size=int(os.environ.get("WORLD_SIZE", 1)),
-        local_rank=int(os.environ.get("LOCAL_RANK", 0)),
-    )
-
-    # Placeholder MMDiT model (pre-trained assumed)
-    mmdit_model = MMDiTX(
-        input_size=None,
-        patch_size=2,
-        in_channels=4,
-        depth=36,
-        mlp_ratio=4.0,
-        learn_sigma=False,
-        adm_in_channels=768,
-        context_embedder_config={"target": "torch.nn.Linear", "params": {"in_features": 768, "out_features": 1152}},
-        out_channels=4,
-        pos_embed_max_size=64,
-        num_patches=4096,
-        dtype=config.dtype,
-        device=config.device,
-        verbose=True,
-    )
-    # Adjust hidden_size as before (placeholder adjustment)
-    mmdit_model.x_embedder.proj = nn.Conv2d(4, 1152, kernel_size=2, stride=2, bias=True, dtype=config.dtype, device=config.device)
-    for block in mmdit_model.joint_blocks:
-        block.context_block.attn.qkv = nn.Linear(1152, 1152 * 3, bias=True, dtype=config.dtype, device=config.device)
-        block.context_block.attn.proj = nn.Linear(1152, 1152, dtype=config.dtype, device=config.device)
-        block.x_block.attn.qkv = nn.Linear(1152, 1152 * 3, bias=True, dtype=config.dtype, device=config.device)
-        block.x_block.attn.proj = nn.Linear(1152, 1152, dtype=config.dtype, device=config.device)
-        block.x_block.mlp.fc1 = nn.Linear(1152, int(1152 * 4), dtype=config.dtype, device=config.device)
-        block.x_block.mlp.fc2 = nn.Linear(int(1152 * 4), 1152, dtype=config.dtype, device=config.device)
-    mmdit_model.final_layer.linear = nn.Linear(1152, 2 * 2 * 4, bias=True, dtype=config.dtype, device=config.device)
-    mmdit_model.final_layer.adaLN_modulation[-1] = nn.Linear(1152, 2 * 1152, bias=True, dtype=config.dtype, device=config.device)
-
-    # Placeholder data loaders
-    from torch.utils.data import Dataset, DataLoader
-    class DummyDataset(Dataset):
-        def __init__(self, is_video=False):
-            self.is_video = is_video
-        def __len__(self):
-            return 1000
-        def __getitem__(self, idx):
-            if self.is_video:
-                return torch.randn(48, 4, 45, 80), torch.randn(768)  # Video latents
-            return torch.randn(4, 64, 64), torch.randn(768)  # Image latents
-
-    image_loader = DataLoader(DummyDataset(is_video=False), batch_size=config.image_batch_size // config.world_size, shuffle=True)
-    video_loader = DataLoader(DummyDataset(is_video=True), batch_size=config.video_batch_size // config.world_size, shuffle=True)
-
-    # Setup and run training
-    training_loop = setup_apt_training(mmdit_model, config, image_loader, video_loader)
-    training_loop.train()
-
-             
 def initialize_models(pretrained_mmdit: MMDiTX, max_timesteps: int = 1000):
     """Initialize generator and discriminator (Sections 3.2, 3.3)."""
     # Generator from distilled weights (assumed pre-distilled here)
@@ -644,11 +656,239 @@ def train_apt(image_data_loader, video_data_loader):
     return trainer
 
 
-# Example usage (placeholder for actual data and model)
-# if __name__ == "__main__":
-#     # Assume pretrained_mmdit is loaded (e.g., from a checkpoint)
-#     pretrained_mmdit = MMDiTX(...)  # Replace with actual initialization
-#     image_data_loader = ...  # Placeholder for 1024px image data loader (batch size 9062)
-#     video_data_loader = ...  # Placeholder for 1280x720, 24fps, 2s video data loader (batch size 2048)
-#     trainer = train_apt(image_data_loader, video_data_loader, pretrained_mmdit)
 
+
+def load_sd35_weights(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> dict:
+    with safe_open(model_path, framework="pt", device=device) as f:
+        state_dict = {k: f.get_tensor(k).to(dtype=dtype) for k in f.keys()}
+    
+    # Map SD3.5 keys to Seaweed’s MMDiT structure
+    mapped_state_dict = {}
+    prefix = "model.diffusion_model."
+    for key, tensor in state_dict.items():
+        if key.startswith(prefix):
+            new_key = key[len(prefix):]
+            if "x_embedder" in new_key:
+                mapped_state_dict[f"x_embedder.{new_key.split('x_embedder.')[-1]}"] = tensor
+            elif "y_embedder" in new_key:
+                mapped_state_dict[f"y_embedder.{new_key.split('y_embedder.')[-1]}"] = tensor
+            elif "joint_blocks" in new_key:
+                mapped_state_dict[new_key] = tensor  # Direct mapping for transformer blocks
+            elif "final_layer" in new_key:
+                mapped_state_dict[new_key] = tensor
+    return mapped_state_dict
+
+
+    
+class APTTrainingSetup:
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16,
+        learning_rate: float = 5e-6,
+        ema_decay: float = 0.995
+    ):
+        self.device = device
+        self.dtype = dtype
+        
+        # Load SD3.5 model
+        print("Loading SD3.5 model...")
+        self.base_model = load_sd35_model(model_path, device)
+        self.base_model.to(dtype=dtype)
+        
+        # Initialize generator
+        print("Initializing generator...")
+        self.generator = APTGenerator(
+            self.base_model,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Initialize discriminator
+        print("Initializing discriminator...")
+        self.discriminator = APTDiscriminator(
+            self.base_model,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Initialize optimizers
+        self.g_optimizer = torch.optim.RMSprop(
+            self.generator.parameters(),
+            lr=learning_rate,
+            alpha=0.9
+        )
+        self.d_optimizer = torch.optim.RMSprop(
+            self.discriminator.parameters(),
+            lr=learning_rate,
+            alpha=0.9
+        )
+        
+        # Initialize EMA
+        self.ema = EMAModel(self.generator, decay=ema_decay)
+        
+    def train_step(self, real_samples: torch.Tensor, conditions: torch.Tensor, is_video: bool = False, noise: Optional[torch.Tensor] = None):
+        # Move data to device
+        real_samples = real_samples.to(self.device, dtype=self.dtype)  # [B, T, 16, H, W]
+        conditions = conditions.to(self.device, dtype=self.dtype)  # [B, 4096]
+
+        if noise is None:
+            shape = real_samples.shape
+            noise = torch.randn(shape, device=self.device, dtype=self.dtype)
+            
+        # Train discriminator
+        self.d_optimizer.zero_grad()
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            # Generate fake samples
+            noise = torch.randn_like(real_samples)
+            fake_samples = self.generator(noise, conditions)
+            
+            # Get discriminator outputs
+            d_real = self.discriminator(real_samples, conditions, is_video)
+            d_fake = self.discriminator(fake_samples.detach(), conditions, is_video)
+            
+            # Calculate discriminator loss
+            d_loss = -(torch.mean(F.logsigmoid(d_real)) + 
+                      torch.mean(F.logsigmoid(-d_fake)))
+            
+        d_loss.backward()
+        self.d_optimizer.step()
+        
+        # Train generator
+        self.g_optimizer.zero_grad()
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            # Generate new fake samples
+            noise = torch.randn_like(real_samples)
+            fake_samples = self.generator(noise, conditions)
+            
+            # Get discriminator output for fake samples
+            d_fake = self.discriminator(fake_samples, conditions, is_video)
+            
+            # Calculate generator loss
+            g_loss = -torch.mean(F.logsigmoid(d_fake))
+            
+        g_loss.backward()
+        self.g_optimizer.step()
+        
+        # Update EMA
+        self.ema.update()
+        
+        return {
+            "g_loss": g_loss.item(),
+            "d_loss": d_loss.item()
+        }
+        
+    @torch.no_grad()
+    def generate_samples(
+        self,
+        conditions: torch.Tensor,
+        num_samples: int = 1,
+        use_ema: bool = True
+    ) -> torch.Tensor:
+        if use_ema:
+            self.ema.apply_shadow()
+            
+        conditions = conditions.to(self.device, dtype=self.dtype)
+        noise = torch.randn(
+            num_samples, 4, 64, 64,  # Latent space dimensions
+            device=self.device,
+            dtype=self.dtype
+        )
+        
+        samples = self.generator(noise, conditions)
+        
+        if use_ema:
+            self.ema.restore()
+            
+        return samples
+
+# Example usage
+def main():
+    model_path = "./models/sd3.5_medium.safetensors"
+    
+    # Initialize training setup
+    trainer = APTTrainingSetup(
+        model_path=model_path,
+        device="cuda",
+        dtype=torch.float16
+    )
+    
+    # Example training loop
+    for epoch in range(350):  # As per paper specifications
+        # Your dataloader iteration here
+        real_samples = torch.randn(8, 4, 64, 64)  # Example batch
+        conditions = torch.randn(8, 768)  # Example CLIP embeddings
+        
+        losses = trainer.train_step(real_samples, conditions)
+        
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}")
+            print(f"Generator loss: {losses['g_loss']:.4f}")
+            print(f"Discriminator loss: {losses['d_loss']:.4f}")
+            
+        if epoch % 50 == 0:
+            # Generate samples
+            samples = trainer.generate_samples(conditions[:1], num_samples=1)
+            # Save or process samples as needed
+
+if __name__ == "__main__":
+    main()
+             
+
+
+
+# # Example usage
+# if __name__ == "__main__":
+#     # Configuration
+#     config = APTConfig(
+#         world_size=int(os.environ.get("WORLD_SIZE", 1)),
+#         local_rank=int(os.environ.get("LOCAL_RANK", 0)),
+#     )
+
+#     # Placeholder MMDiT model (pre-trained assumed)
+#     mmdit_model = MMDiTX(
+#         input_size=None,
+#         patch_size=2,
+#         in_channels=4,
+#         depth=36,
+#         mlp_ratio=4.0,
+#         learn_sigma=False,
+#         adm_in_channels=768,
+#         context_embedder_config={"target": "torch.nn.Linear", "params": {"in_features": 768, "out_features": 1152}},
+#         out_channels=4,
+#         pos_embed_max_size=64,
+#         num_patches=4096,
+#         dtype=config.dtype,
+#         device=config.device,
+#         verbose=True,
+#     )
+#     # Adjust hidden_size as before (placeholder adjustment)
+#     mmdit_model.x_embedder.proj = nn.Conv2d(4, 1152, kernel_size=2, stride=2, bias=True, dtype=config.dtype, device=config.device)
+#     for block in mmdit_model.joint_blocks:
+#         block.context_block.attn.qkv = nn.Linear(1152, 1152 * 3, bias=True, dtype=config.dtype, device=config.device)
+#         block.context_block.attn.proj = nn.Linear(1152, 1152, dtype=config.dtype, device=config.device)
+#         block.x_block.attn.qkv = nn.Linear(1152, 1152 * 3, bias=True, dtype=config.dtype, device=config.device)
+#         block.x_block.attn.proj = nn.Linear(1152, 1152, dtype=config.dtype, device=config.device)
+#         block.x_block.mlp.fc1 = nn.Linear(1152, int(1152 * 4), dtype=config.dtype, device=config.device)
+#         block.x_block.mlp.fc2 = nn.Linear(int(1152 * 4), 1152, dtype=config.dtype, device=config.device)
+#     mmdit_model.final_layer.linear = nn.Linear(1152, 2 * 2 * 4, bias=True, dtype=config.dtype, device=config.device)
+#     mmdit_model.final_layer.adaLN_modulation[-1] = nn.Linear(1152, 2 * 1152, bias=True, dtype=config.dtype, device=config.device)
+
+
+#     class DummyDataset(Dataset):
+#         def __init__(self, is_video=False):
+#             self.is_video = is_video
+#         def __len__(self):
+#             return 1000
+#         def __getitem__(self, idx):
+#             if self.is_video:
+#                 return torch.randn(48, 4, 45, 80), torch.randn(768)  # Video latents
+#             return torch.randn(4, 64, 64), torch.randn(768)  # Image latents
+
+#     image_loader = DataLoader(DummyDataset(is_video=False), batch_size=config.image_batch_size // config.world_size, shuffle=True)
+#     video_loader = DataLoader(DummyDataset(is_video=True), batch_size=config.video_batch_size // config.world_size, shuffle=True)
+
+#     # Setup and run training
+#     training_loop = setup_apt_training(mmdit_model, config, image_loader, video_loader)
+#     training_loop.train()
