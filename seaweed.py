@@ -5,6 +5,12 @@ from typing import Dict, List, Optional, Tuple
 from mmditx import MMDiTX, DismantledBlock, PatchEmbed, TimestepEmbedder, VectorEmbedder
 from pylint.lint import Run
 from logger import logger
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import os
+from pathlib import Path
+import numpy as np
+from tqdm import tqdm
 
 
 class APTCrossAttentionBlock(nn.Module):
@@ -164,44 +170,6 @@ class EMAModel:
                 param.data = self.backup[name].clone()
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-from typing import Dict, List, Optional, Tuple
-from mmditx import MMDiTX, PatchEmbed, TimestepEmbedder, VectorEmbedder
-import os
-from pathlib import Path
-import logging
-import numpy as np
-from tqdm import tqdm
-
-# Existing supporting classes (abridged for brevity)
-class APTCrossAttentionBlock(nn.Module):
-    """Cross-attention block for APT discriminator (Section 3.3)."""
-    def __init__(self, hidden_size: int, num_heads: int, device=None, dtype=None):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.learnable_token = nn.Parameter(torch.randn(1, 1, hidden_size, dtype=dtype, device=device))
-        self.norm = nn.LayerNorm(hidden_size, dtype=dtype, device=device)
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True, dtype=dtype, device=device)
-        self.proj = nn.Linear(hidden_size, hidden_size, dtype=dtype, device=device)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        token = self.learnable_token.expand(B, -1, -1)
-        x, token = self.norm(x), self.norm(token)
-        q = self.qkv(token)[:, :, :self.hidden_size]
-        k, v = self.qkv(x)[:, :, self.hidden_size:2*self.hidden_size], self.qkv(x)[:, :, 2*self.hidden_size:]
-        q = q.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        attn = F.softmax((q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5), dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B, -1, self.hidden_size)
-        return self.proj(x)
 
 
 # Enhanced APTTrainer
