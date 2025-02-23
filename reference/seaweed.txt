@@ -1,0 +1,1055 @@
+Diffusion Adversarial Post-Training for One-Step Video Generation
+Shanchuan Lin* Xin Xia Yuxi Ren Ceyuan Yang Xuefeng Xiao Lu Jiang
+ByteDance Seed
+https://seaweed-apt.com
+Abstract
+The diffusion models are widely used for image and video
+generation, but their iterative generation process is slow
+and expansive. While existing distillation approaches have
+demonstrated the potential for one-step generation in the
+image domain, they still suffer from significant quality
+degradation. In this work, we propose Adversarial PostTraining (APT) against real data following diffusion pre-
+*peterlin@bytedance.com
+training for one-step video generation. To improve the
+training stability and quality, we introduce several improvements to the model architecture and training procedures,
+along with an approximated R1 regularization objective.
+Empirically, our experiments show that our adversarial
+post-trained model, Seaweed-APT, can generate 2-second,
+1280×720, 24fps videos in real time using a single forward
+evaluation step. Additionally, our model is capable of generating 1024px images in a single step, achieving quality
+comparable to state-of-the-art methods.
+11. Introduction
+The diffusion method [21, 65] has become the de facto standard for learning large-scale image generation [1, 7, 13, 14,
+49, 52, 54, 56] and video generation [2, 4, 31, 50, 72, 85].
+Reducing the generation cost is an important research
+area in diffusion methods. Among the various methods proposed, diffusion step distillation has emerged as an effective approach to reduce the inference step. Generally, these
+methods start with a pre-trained diffusion model as a teacher
+that generates targets through multiple diffusion inference
+steps. They then apply knowledge distillation [19] to train
+a student model that can replicate the teacher’s output using much fewer diffusion inference steps. Previous methods
+[6, 35, 40, 41, 53, 57, 59, 60, 64, 66, 79] focus on preserving the generative distribution of the diffusion teacher while
+reducing inference steps.
+One-step generation is often considered the pinnacle of
+diffusion step distillation, yet it presents the most significant
+challenges. It deviates from the fundamental principle of
+diffusion models, which rely on iterative denoising steps to
+uncover the data distribution. While previous research has
+demonstrated notable advancements for generating images
+in a single step with promising results [6, 35, 40, 53, 60, 64,
+66, 79], producing high-quality images in one step remains
+challenging, particularly in achieving fine-grained details,
+minimizing artifacts, and preserving the structural integrity.
+Accelerated video generation, however, has seen limited
+progress in the literature. Early efforts utilizing generative
+adversarial networks (GANs) [16], e.g. StyleGAN-V [63]
+can only generate domain-specific data with poor quality in
+modern standards. With the rise of diffusion methods, recent studies have begun exploring the extension of image
+distillation techniques to video diffusion models. However,
+earlier works [33, 70, 83] have only explored distillation
+on small-scale and low-resolution video models [17, 71]
+that only generate 512×512 videos for a total of 16 frames.
+A concurrent work [80] has attempted distillation of largescale video models at 640×352 12fps. These methods still
+generally need 4 diffusion steps. Given the prohibitive computational cost associated with high-resolution video generation, e.g., generating just a few seconds of 1280×720
+24fps videos can take multiple minutes even on the stateof-the-art GPUs like the H100, our work aims at generating
+high-resolution videos in a single step.
+In this paper, we introduce a new approach for onestep image and video generation. Our method utilizes a
+pre-trained diffusion model, specifically the diffusion transformer (DiT) [48], as initialization, and continues training
+the DiT using the adversarial training objective against real
+data. It is important to notice the contrast to existing diffusion distillation methods, which use a pre-trained diffusion
+model as a distillation teacher to generate the target. Instead, our method performs adversarial training of the DiT
+directly on real data, using the pre-trained diffusion model
+only for initialization. We term this method Adversarial
+Post-Training or APT, as it parallels supervised fine-tuning
+commonly performed during the post-training stage. Empirically, we observe that APT provides two benefits. First,
+APT eliminates the substantial cost associated with precomputing video samples from the diffusion teacher. Second, unlike diffusion distillation, where the quality is inherently constrained by the diffusion teacher, APT demonstrates the ability to surpass the teacher by a large margin in
+some evaluation criteria, in particular, improving realism,
+resolving exposure issues, and enhancing fine details.
+Direct adversarial training on diffusion models is highly
+unstable and prone to collapse, particularly in our case,
+where both the generator and discriminator are exceptionally large transformer models, each containing billions of
+parameters. To tackle this issue, our method introduces
+several key designs to stabilize training. It incorporates a
+generator initialized through deterministic distillation and
+introduces several enhancements to the discriminator, including transformer-based architectural changes, a discriminator ensemble across timesteps, and an approximated R1
+regularization loss to facilitate large-scale training.
+By virtue of APT, we have trained what may be one of
+the largest GAN ever reported to date (∼16B), capable of
+generating both images and videos with a single forward
+evaluation. Our experiments demonstrate that our model
+achieves overall performance comparable to state-of-the-art
+one-step image generation methods, as evaluated through
+the user study based on three key metrics: visual fidelity,
+structural integrity, and text alignment. More importantly,
+to the best of our knowledge, our model is the first to
+demonstrate high-resolution video generation in a single
+step (1280×720 24fps), surpassing the previous state-ofthe-art, which generates 512×512 or 640×352 up to 12fps
+videos in four steps. On a H100 GPU, our model can generate a two-second 1280×720 24fps video latent using a
+single step in two seconds. On 8×H100 GPUs with parallelization, the entire pipeline with text encoder and latent
+decoder runs in real time.
+2. Related Works
+Accelerating Diffusion Models. Diffusion step distillation is a common and effective approach to accelerate diffusion models. Existing methods address this problem using
+either deterministic or distributional methods.
+Deterministic methods exploit the fact that diffusion
+models learn a deterministic probability flow with exact
+noise-to-sample mappings and aim to predict the exact
+teacher output using fewer steps. Prior works include
+progressive distillation [57], consistency distillation [40–
+42, 64, 66], and rectified flow [38, 39, 77]. Deterministic
+methods are easy to train using simple regression loss, but
+2the results of few-step generation are very blurry, due to
+optimization inaccuracy and reduced Lipschitz constant in
+the student model [35]. For large-scale text-to-image generation, deterministic methods generally require more steps,
+e.g. eight steps, to generate desirable samples [41, 42].
+On the other hand, distributional methods only aim to approximate the same distribution of the diffusion teacher. Existing works employ adversarial training [6, 24, 44, 59, 76],
+score distillation [43, 78], or both [5, 60, 79]. Recent
+works have also explored combining distributional distillation with the deterministic probability flow [30, 35, 53].
+However, existing methods have severe artifacts for onestep generation and still require multiple steps to obtain
+desirable results. Notably, LADD [59] uses pre-generated
+teacher images as the adversarial target. Lightning [35]
+and Hyper [53] learn the teacher trajectory with the adversarial objective in the loop but require training intermediate timesteps. DMD [78] applies score distillation [62, 74]
+from the teacher model, which sets the teacher as the upper
+bound for quality. The above methods use the pre-trained
+model as a teacher to compute targets for learning, but this
+incurs a high computational cost for videos. DMD2 [79]
+and ADD [60] apply both adversarial and score distillation
+objectives. Though the adversarial objective is on real data,
+the score distillation objective forces the student to resemble the teacher. The closest to our work is UFO-Gen [76]
+which also only applies adversarial training on real data.
+However, its discriminator adopts the DiffusionGAN [73]
+approach, and it uses the corrupted rather than the original
+real data as the input to the discriminator, while our method
+feeds the discriminator with real, uncorrupted data. Hence,
+our approach follows the standard adversarial training as in
+GAN more closely. Additionally, UFO-Gen’s image generator and discriminator are convolutional models under 1B
+parameters, while ours are transformer models with 8B parameters and generate both image and video.
+For video generation, some of these methods [33, 70, 83]
+have been extended to small-scale and low-resolution video
+models such as AnimateDiff [17] and ModelScope [71].
+These models only generate low-resolution 256px or 512px
+videos of 16 frames. Very recently, a concurrent work [80]
+has demonstrated the generation of 640×352 12fps videos
+in four steps. To the best of our knowledge, our work is the
+first to demonstrate one-step generation of 1280×720 24fps
+videos with a duration of 2 seconds.
+One-Step Video Generation. One-step video generation
+works may trace back to the use of generative adversarial networks (GAN) [16], e.g. DVD-GAN [9], MoCoGANHD [68], DIGAN [82], and StyleGAN-V [63], etc. They
+can generate up to 1024px resolution videos but are trained
+only on domain-restricted data, e.g. talking head videos,
+and the quality is poor by modern standards. More recently, AnimateDiff-Lightning [33] and Motion Consistency Model [83] have attempted to distill the AnimateDiff
+video diffusion model [17] to one step. They can generate
+512×512 videos for a total of 16 frames but have substantial artifacts and quality degradation. Compared to previous works, our method produces one-step video results with
+substantially better quality in high resolution.
+Stable Adversarial Training. R1 regularization [55] has
+been shown effective for GAN convergence [45]. It has
+been used by many prior GANs to improve performance
+[3, 22, 23, 25–27]. However, many recent large-scale adversarial works [35, 53, 59, 76] have either completely not used
+R1, or only used it for parts of the discriminator network
+[60]. This is likely due to its higher-order gradient computation is computationally expensive and is not supported by
+modern deep learning software stacks, i.e. FSDP [84], gradient checkpointing [8], FlashAttention [10, 11, 61], and
+other fused operators [46]. Our paper proposes an approximation method to address this issue and we find our approximated R1 loss is critical for preventing training collapse.
+3. Method
+Our objective is to convert a text-to-video diffusion model
+to a one-step generator. We achieve this by fine-tuning the
+diffusion model with the generative adversarial objective
+against real data. We refer to this process as Adversarial
+Post-Training or APT, due to its resemblance to supervised
+fine-tuning in the conventional post-training stage.
+3.1. Overview
+We build our method on a pre-trained text-to-video diffusion model capable of generating both images and videos
+through T diffusion steps. The training follows adversarial optimization that alternates through a min-max game.
+The discriminator D classifies real samples from generated
+ones, maximizing −LD , while the generator G aims to generate samples that fool the discriminator, minimizing LG.
+Formerly, we have:
+LD = E
+x,c∼T
+fD (D(x, c)) + E
+z∼N
+c∼T
+fG(D(G(z, c), c)), (1)
+LG = E
+z∼N
+c∼T
+gG(D(G(z, c), c)), (2)
+where N denotes the standard Gaussian distribution, and
+T represents the training data comprising a paired latent
+sample x and text condition c. The latent and noise samples are of size x, z ∈ Rt′ ×h′ ×w′ ×c′
+, where t′, h′, w′, c′
+represent the dimensions of time, height, width, and channel. The functions fD , fG, and gG are the output functions. Here, we use the simple non-saturating variant [16]:
+fD (x) = gG(x) = log σ(x) and fG(x) = log(1 − σ(x)),
+where σ(x) is the sigmoid function.
+Figure 1 illustrates the overall architecture. Both the
+generator and the discriminator backbone use the diffusion
+3Discriminator
+Transformer
+(36 Layers)
+Initialized from
+diffusion model
+Generator
+Transformer
+(36 Layers)
+Initialized from
+consistency model
+v to x TexttNoise TextT
+Linear
+GeLU
+Linear
+Norm
+Proj Q
+Emb
+Proj KProj V
+Pre-RMSNorm
+QK RMSNorm
+Attention
++
++
+Cross Attention
+MLP
+Proj O
+Layer 16
+Layer 26
+Layer 36
+Cross Attention
+MLP
+Cross Attention
+MLP
+Cross Attention
+MLP
+Concat
+LayerNorm
+LinearFigure 1. Architecture overview. Both the generator and the discriminator backbone share the diffusion transformer architecture
+(blue). We add additional output heads on the discriminator network to produce the scalar logit (green).
+model architecture but are initialized with different strategies which will be discussed later in this section. Concretely, our diffusion model uses the MMDiT architecture
+[13] and is trained with the flow-matching objective [37]
+over a mixture of images and videos at their native resolutions [12] in the latent space [54]. The model comprises
+36 layers of transformer blocks, amounting to a total of 8
+billion parameters.
+3.2. Generator
+We find direct adversarial training on the diffusion model
+leads to collapse. To tackle this, we first perform deterministic distillation. We adopt discrete-time consistency distillation [64, 66] with mean squared error loss for simplicity.
+The model is distilled with a constant classifier-free guidance [20] scale of 7.5 and a fixed negative prompt.
+Let ˆG denote the distilled model. Given noise sample z
+and text condition c, the model ˆG predicts the velocity field
+ˆv, which can be converted to sample prediction ˆx:
+ˆv = ˆG(z, c, T ), (3)
+ˆx = z − ˆv. (4)
+Although the generated sample ˆx is very blurry, ˆG provides an effective initialization for the subsequent adversarial training. Therefore, we initialize our generator G with
+the weights of ˆG, defined as:
+G(z, c) := z − ˆG(z, c, T ). (5)
+For the subsequent training, we primarily focus on onestep generation capability and always feed the final timestep
+T to the underlying model.
+3.3. Discriminator
+The discriminator is trained to produce a logit that effectively distinguishes between real samples x and generated
+samples ˆx. One-step generation requires a discriminator
+with sufficient learning capacity that can be stably trained.
+In this subsection, we discuss several effective designs that
+contribute to stable training and quality improvement. Refer
+to the detailed results presented in our ablation studies.
+First, following prior works [33, 35, 59, 75], we initialize the discriminator backbone using the pre-trained diffusion network and let it operate directly in the latent space.
+Therefore, the discriminator backbone also comprises 36
+layers of transformer blocks and 8 billion parameters. We
+find that training all parameters without freezing improves
+the quality. Additionally, we find that initializing it with the
+original diffusion model weights, as opposed to the distilled
+model weights used by the generator, yields better results.
+Second, we modify the diffusion transformer architecture to produce logits. Specifically, we introduce new crossattention-only transformer blocks at the 16th, 26th, and 36th
+layers of the transformer backbone. Each block uses a single learnable token as the query to cross-attend to all the visual tokens from the backbone as the key and value, producing a single token output. These tokens are then channelconcatenated, normalized, and projected to yield a single
+scalar logit output. We find that using features from multiple layers enhances the structure and composition of the
+generated samples.
+Third, we directly provide the discriminator the raw sample x, ˆx without any noise corruptions. This avoids the
+introduction of artifacts to our generated samples. However, since our discriminator backbone is initialized from
+the diffusion model, and the diffusion pre-training objective
+at t = 0 is not meaningful, we find using t = 0 for our discriminator leads to collapse. Therefore, we propose to use
+an ensemble of different timestep values as input. Specifically, let ˆD denote the underlying discriminator model, we
+define the D(x, c) in Equation (2) as:
+D(x, c) := E
+t∼shift(U (0,T ),s)
+ ˆD(x, t, c), (6)
+where t is sampled uniformly from the interval [0, T ] and
+then shifted by transformation function:
+shift(t, s) := s × t
+1 + (s − 1) × t . (7)
+4The shifting factor s is a hyperparameter determined by the
+latent dimension t′, h′, and w′. We use s = 1 for images
+and s = 12 for videos for our experiment. For efficiency, we
+sample a single t per training sample x to compute Equation (6).
+3.4. Regularized Discriminator
+Our discriminator, comprising billions of parameters, possesses significant learning capacity yet is also prone to collapse. Ensuring stable training for such a powerful discriminator is therefore crucial to our problem. The R1 regularization [55] is an effective technique in facilitating the convergence of adversarial training [45]. It penalizes the discriminator gradient ▽x on real data x, preventing the adversarial
+training from deviating from the Nash-equilibrium:
+LR1 = ∥▽xD(x, c)∥2
+2. (8)
+Training with R1 requires higher-order gradient computation. The first backward computes the first-order discriminator gradient on input ▽x as the R1 loss. The second backward computes the second-order gradient of the R1 loss regarding the discriminator parameter θ for the discriminator
+updates.
+However, PyTorch FSDP [84], gradient checkpointing
+[8], FlashAttention [10, 11, 61], and other fused operators
+[46] do not support higher-order gradient computation or
+double backward at the time of writing, preventing the use
+of R1 in large-scale transformer models.
+We propose an approximated R1 loss, written as:
+LaR1 = ∥D(x, c) − D(N (x, σI), c)∥2
+2. (9)
+Specifically, we perturb the real data with Gaussian noise of
+small variance σ. The loss encourages the discriminator’s
+predictions to be close between the real data and its perturbation, thereby reducing the discriminator gradient on real
+data and achieving a consistent objective as the original R1
+regularization. Therefore, the final discriminator loss LD is
+defined as:
+LD = E
+x,c∼T
+fD (D(x, c)) + E
+z∼N
+c∼T
+fG(D(G(z, c), c))
++ λ E
+x,c∼T
+∥D(x, c) − D(N (x, σI), c)∥2
+2
+. (10)
+In our experiments, we use λ = 100, σ = 0.01 for images
+and σ = 0.1 for videos. The generator and the discriminator are optimized in alternating steps, in which the approximated R1 is applied on every discriminator step.
+3.5. Training Details
+We first train the model on only images. The images are
+1024px resolution. We use 128∼256 H100 GPUs with gradient accumulation to reach a batch size of 9062. We use
+a learning rate of 5e−6 for both the generator and the discriminator. We find the model adapts quickly to generate
+sharp images, so we use an Exponential Moving Average
+(EMA) decay rate of 0.995. We adopt the EMA checkpoint
+after 350 updates on the generator before the quality starts
+to degrade.
+We then train the model on only videos. The videos
+are of resolution 1280×720 and we clip them to 2 seconds
+at 24fps. For the generator, we use the EMA checkpoint
+from the image stage as the initialization for video training.
+For the discriminator, we re-initialize from the diffusion
+weights. We use 1024 H100 GPUs and gradient accumulation to reach a batch size of 2048. We lower the learning
+rate to 3e−6 for stability and train it for 300 updates. After training the model for only one step, we find it can also
+zero-shot perform two-step inference with improved details
+and structures. However, more steps lead to artifacts.
+RMSProp optimizer is used with α = 0.9. This is equivalent to Adam optimizer [29] with β1 = 0, β2 = 0.9 with
+reduced memory consumption. We do not use weight decay and gradient clipping. The entire training is conducted
+in BF16 mixed precision. We use the same datasets as used
+by the original diffusion model.
+4. Experimental Results
+This section empirically verifies the proposed Adversarial
+Post-Training (APT) method. Section 4.1 provides a qualitative comparison of our method against other one-step image generation baselines and an analysis of the characteristics of the image and video results generated by our approach. Section 4.2 presents several user studies that quantitatively assess the quality of the generated outputs. More
+results are available on our website: https://seaweedapt.com/.
+Baseline. For comparison with one-step image generation
+methods, we select FLUX-Schnell [15], SD3.5-Turbo [59],
+SDXL-DMD2 [79], SDXL-Hyper [53], SDXL-Lightning
+[35], SDXL-Nitro [6], and SDXL-Turbo [60] as the comparison baselines. These models are selected because they
+are either the latest research publications or commonly
+available open-source distilled models. We also compare
+their original diffusion models against ours in 25 Euler
+steps. We use the default CFG [20] setting of each model as
+configured in diffusers [69], while ours uses CFG 7.5 as our
+best setting. CFG doubles the neural function evaluation
+(NFE) to 50, except FLUX [14] which has the CFG baked
+in. All models are 1024px, except SDXL-Turbo which only
+supports 512px.
+4.1. Qualitative Evaluation
+For image generation, we first compare our APT model’s
+generation in a single step and our original diffusion model
+5Diffusion 25 Steps (50NFE) APT 1 Step (1NFE) Diffusion 25 Steps (50NFE) APT 1 Step (1NFE)
+Figure 2. Image generation comparison between the original diffusion 25-step model and adversarial post-trained (APT) 1-step model.
+The diffusion model with classifier-free guidance can generate over-exposed images that look unnatural. APT improves visual fidelity.
+Ours FLUX SD3.5 SDXL
+Diffusion APT Dev Schnell Diffusion Turbo Diffusion DMD2 Hyper Lightning Nitro
+25 Steps 1 Step 25 Steps 1 Step 25 Steps 1 Step 25 Steps 1 Step 1 Step 1 Step 1 Step
+(a) A frustrated child.
+(b) The city of London.
+(c) A close-up of the eyes of an owl.
+(d) A tree growing through a fence.
+Figure 3. Image generation comparison across methods and models. We show results of 1-step generation and the corresponding diffusion
+model 25-step generation. Our method is significantly better in image details and is among the best in structural integrity.
+6Diffusion Adversarial Post-Trained
+25 Steps (50NFE) 2 Steps (2NFE) 1 Step (1NFE)
+(a) Good case: Adversarial post-training enhances details and realism. A Western princess, with sunlight shining through the leaves on her face, facial
+close-up.
+(b) Good case: Adversarial post-training produces more realistic and cinematic results, whereas the diffusion results look synthetic. Wong Kar-wai
+style, on the streets of Shanghai, back shot of a woman walking in a cheongsam, nostalgic sepia tone, brightly saturated colors.
+(c) Average case: Adversarial post-training can produce the scene but with degradation in structure and text alignment. First-person perspective,
+the camera passes through a classroom entering the school playground.
+(d) Failure case: Adversarial post-training can fail at some prompts. A terracotta warrior holds a white paper in one hand, and the paper flutters in the
+wind. The background is a museum.
+Figure 4. Video generation results. Adversarial post-training can improve visual fidelity, i.e. details and realism, but few-step generation
+still has degradation in structure and text alignment.
+7using 25 diffusion steps in Figure 2. We observe that the
+diffusion model with classifier-free guidance often generates over-exposed images, rendering the images appear synthetic. In comparison, the APT model tends to generate images with a more realistic tone. Figure 3 further compares
+our method with other one-step image generation methods.
+The results suggest that our method shows advantages in
+preserving details and structural integrity.
+For video generation, Figure 4 compares our APT onestep and two-step results with the original diffusion model
+for 25 steps. Both the good and the bad cases generated
+by the APT method are displayed. For the good cases, the
+APT improves visual details and realism. The one- or twostep APT models still perform worse in terms of structural
+integrity and text alignment compared to the original 25step diffusion model. We refer readers to view the videos
+on our website.
+4.2. User Study
+Evaluation Protocol. We conduct a series of user studies with respect to three criteria: visual fidelity, structural
+integrity, and text alignment. Specifically, visual fidelity
+accounts for texture, details, color, exposure, and realism;
+structural integrity focuses on the structural correctness of
+the objects and body parts; text alignment measures closeness to the conditional prompts. Human raters are shown
+pairs of samples generated by different models and asked to
+choose their preferences regarding each criterion or to indicate no preference if a decision cannot be made.
+Afterward, the preference score is calculated as (G −
+B)/(G + S + B), where G denotes the number of good
+samples preferred, B denotes the number of bad samples
+not preferred, and S denotes the number of similar samples without preference. Thus, a score of 0% represents
+equal preference between the two models. +100% represents the model is preferred over all evaluated samples, and
+vice versa for −100%.
+For image evaluation, we follow the evaluation protocol used in previous diffusion distillation works [59, 60]
+and generate samples using 300 randomly selected prompts
+from PartiPrompt [81] and DrawBench [56]. For each
+prompt, we generate 3 images using different seeds and
+have 3 raters to mark preferences in each category. For onestep video evaluation, we generate videos using 96 custom
+prompts. We generate one video per prompt which is also
+evaluated by 3 raters in each category. Our entire user study
+takes a total of 50,328 sample comparisons.
+Additionally, following the previous works [35, 59, 60],
+we also report the FID [18], PFID [35], and CLIP [51] metrics on COCO dataset [36]. Note that we find these automatic metrics to be less accurate than user studies for assessing the model’s actual performance. We provide the results and discussion in Appendix A.
+Image One-Step vs. Diffusion
+1 Step vs. 25 Steps
+Visual
+Fidelity
+Structural
+Integrity
+Text
+Align
+FLUX-Schnell [15] -36.6% -24.4% -2.8%
+SD3.5-Large-Turbo [59] -94.4% -30.1% -20.4%
+SDXL-DMD2 [79] -9.3% -16.8% -4.6%
+SDXL-Hyper [53] -8.8% -12.3% -2.1%
+SDXL-Lightning [35] -7.7% -15.1% -17.4%
+SDXL-Nitro-Realism [6] -21.6% -22.7% -5.6%
+SDXL-Turbo [60] -80.1% -14.9% -1.2%
+APT (Ours) +37.2% -13.1% -8.1%
+Table 1. One-step image generation compared to their corresponding original diffusion models in 25 steps.
+Image Generation: One-Step vs. 25-Step. We first compare all one-step model against their corresponding original
+diffusion model in 25 steps in Table 1. The table shows
+that all existing one-step methods have degradation in all
+three evaluation criteria. In terms of structural integrity, our
+method has degradation but is less than almost all existing
+methods except for SDXL-Hyper. Our method is weaker in
+text alignment performance but is still mid-tier among the
+comparison. It is worth noting that our model is the only
+one to achieve a more favorable evaluation criterion (visual
+fidelity), aligning with our qualitative analysis observation
+that adversarial post-training enhances details and realism.
+The improvement over the original 25-step diffusion model
+can be attributed to our method’s approach, which forgoes
+using the diffusion model as a teacher and instead performs
+direct adversarial training on real data. More discussions
+are provided in Section 5.6.
+One-Step Image Generation: Comparison to the Stateof-the-Art. In Table 2, we compare our one-step generation to the state-of-the-art one-step image generation models. We show both the absolute preference score and the
+adjusted relative change based on their corresponding diffusion model baseline. The relative preference score is introduced to account for the varying quality of generation
+by the base models. It is simply calculated as the difference
+between the absolute preference rates and the baseline rates.
+The results in Table 2 demonstrate that our method
+achieves performance comparable to the state-of-the-art in
+one-step image generation. On average, it ranks second in
+absolute preference, trailing FLUX-Schnell, and ranks first
+in relative preference. Compared to the baseline methods,
+our model is preferred for its visual fidelity and structural
+integrity but is less preferred in text alignment. The weaker
+text alignment is a limitation of the APT method. Further
+discussion on the causes of text alignment degradation can
+be found in Section 5.8.
+The relative preference score is introduced to reduce the
+bias that a strong base model can unfairly influence the
+evaluation, irrespective of the one-step acceleration method.
+8Image Ours vs. Others
+1 Step
+Visual
+Fidelity
+Structural
+Integrity
+Text
+Align Average
+Absolute
+FLUX-Schnell [15] +35.7% -21.5% -28.1% -4.6%
+SDXL-DMD2 [79] +34.7% +10.3% -11.8% +11.1%
+SDXL-Nitro-Realism [6] +24.6% +16.7% -4.9% +12.1%
+SDXL-Hyper [53] +43.6% +4.1% -6.7% +13.7%
+SDXL-Lightning [35] +34.1% +14.1% +11.4% +19.9%
+SDXL-Turbo [60] +68.9% +14.9% -7.9% +25.3%
+SD3.5-Large-Turbo [59] +97.8% +7.7% -16.7% +29.6%
+Relative
+SDXL-DMD2 [79] +22.6% +9.1% -12.0% +6.6%
+SDXL-Nitro-Realism [6] +12.5% +15.5% -5.1% +7.6%
+SDXL-Hyper [53] +31.5% +2.9% -6.9% +9.2%
+SDXL-Lightning [35] +22.0% +12.9% +11.2% +15.4%
+SDXL-Turbo [60] +56.8% +13.7% -8.1% +20.8%
+FLUX-Schnell [15] +77.1% +11.4% -9.2% +26.4%
+SD3.5-Large-Turbo [59] +134.0% +33.3% -2.5% +54.9%
+Table 2. Comparison to the state-of-the-art one-step image
+generation. Both absolute and relative preference scores (adjusted for base model performance) are presented. The methods
+are sorted by average preference.
+Image Ours vs. Others
+25 Steps
+Visual
+Fidelity
+Structural
+Integrity
+Text
+Align
+FLUX [14] -41.4% -32.9% -18.9%
+SD3.5-Large [13] -36.2% -25.6% -14.2%
+SDXL [49] +12.1% +1.2% +0.2%
+Table 3. Comparison of other base diffusion models with our
+base model for image generation. All models are evaluated using 25 steps. Since our model is designed to handle both video and
+image generation, its image generation performance is slightly inferior to FLUX and SD3.5.
+Thus we report the base model rates in Table 3. Due to
+our base model handling both video and image generation
+and the use of different training data, our original diffusion
+model is weaker compared to dedicated image models such
+as FLUX [14] and SD3.5 [13]. We highlight these differences in the base model for interpreting the comparison of
+one-step image generation in Table 2.
+One-step Video Generation. Table 4 compares the onestep and two-step video generation results compared to the
+original diffusion baseline using 25 steps. The trend is similar to the image performance, where our model outperforms
+the original diffusion model in visual fidelity, but has degradation in structural integrity and text alignment. Despite the
+degradation, the videos generated in one step maintain decent quality at 1280×720 resolution. We refer readers to
+view the videos on our website. The degradation in structural integrity appears to be more severe in videos compared
+to images since it now involves motions. Our work is a pre-
+Video
+1 and 2 Steps vs. 25 Steps Steps Visual
+Fidelity
+Structural
+Integrity
+Text
+Align
+APT (Ours) 2 +32.3% -31.3% -9.4%
+1 +10.4% -38.5% -8.3%
+Table 4. Comparison of one-step (and two-step) video generation
+with the original 25-step diffusion models.
+liminary proof of concept. We emphasize the need for further research to advance one-step video generation.
+5. Ablation Study and Discussion
+5.1. The Effect of Approximated R1 Regularization
+We find that the approximated R1 regularization is critical
+for maintaining stable training. Without this regularization,
+training collapses rapidly. As shown in Figure 5, the black
+curve represents the discriminator loss without R1 regularization, which quickly approaches zero compared to the
+green curve that includes the loss. When the discriminator
+loss approaches zero, the generator produces colored plates,
+as depicted on the right side of Figure 5.
+Figure 5. Without approximated R1 regularization, the discriminator loss reaches zero (grey) and the training collapses. With
+approximated R1 regularization, the discriminator loss does not
+reach zero (green).
+5.2. Discriminator Design
+We first experiment with using different depths of the pretrained diffusion model as our discriminator. Our intuition is that discriminators are smaller than the generator
+traditionally and using fewer layers may increase training
+throughput. However, as Figure 6 shows, we find that using
+a deeper discriminator with more learning capacity leads to
+better image quality. Therefore, we retain all 36 layers of
+the DiT as trainable parameters in our discriminator.
+We then verify the effectiveness of using multilayer features as discussed in Section 3.3. As Figure 7 shows, we
+find that adding output heads only to the last layer can lead
+to the generation of images with disproportional structure.
+We speculate that this is because the last-layer features have
+a stronger focus on semantics and are less sensitive to the
+low-level structures. We find that using multilayer features
+can significantly mitigate the issue.
+9Half-Depth
+Discriminator
+Two-Third-Depth
+Discriminator
+Full-Depth
+Discriminator
+Layer 14, 16, 18th Layer 18, 22, 26th Layer 16, 26, 36th
+Figure 6. Using a deeper discriminator that includes the full depth
+of the pre-trained network leads to better generation quality.
+Last-Layer Discriminator Multi-Layer Discriminator
+Layer 36th Layer 16, 26, 36th
+Figure 7. Discriminator only using the last layer features can lead
+to the generation of disproportional structures. The multi-layer
+discriminator can mitigate the issue.
+5.3. The Effect of Training Iterations and EMA
+Figure 8 shows the model adapts fast. For the non-EMA
+model, even after 50 updates, it is able to generate sharp
+images. The EMA model generally performs better than the
+non-EMA. We find the quality peaks at 350 updates for the
+EMA model, and training it longer leads to more structural
+degradation.
+0 50 150 250 350 450 550 650
+Figure 8. Training progression measured by generator updates.
+(EMA top, non-EMA bottom)
+5.4. The Effect of the Batch Size
+For images, our early experiments suggest that a larger
+batch size improves stability and structural integrity, confirming with previous research [23, 76]. For videos, we find
+that using a small batch size of 256 leads to mode collapse
+as shown in Figure 9 whereas a large batch size of 1024
+Video Batch Size 256 Video Batch Size 1024
+Seed A Seed B Seed A Seed B
+Figure 9. A large batch size prevents mode collapse. A small batch
+size has mode-collapsed across prompts and seeds.
+does not. Therefore, our final training adopts a large batch
+size of 9062 for images and a batch size of 2048 for videos.
+5.5. Understanding the Model Internals
+We freeze the model and add an additional linear projection
+on every layer. It is trained to match the final layer’s latent prediction with mean squared error loss. This helps us
+visualize the internals of our model. As Figure 10 shows,
+the network’s shallow layers generate the coarse structure
+and the deeper layers generate the high-frequency details.
+This is similar to the iterative generation process of diffusion models, except in our model the entire generation
+process is compressed within the 36 transformer layers in a
+single forward pass.
+Layer 6 Layer 12 Layer 18 Layer 24 Layer 30 Layer 36
+Figure 10. The intermediate result of each transformer layer inside
+the one-step image generation model.
+5.6. The Reason for Visual Improvement
+Diffusion models without classifier-free guidance (CFG)
+[20] generate very poor samples [32]. CFG [20] is used
+ubiquitously to boost perceptual quality and text alignment,
+but recent works have shown that it can push the generated
+distribution away from the training distribution, resulting in
+samples that appear synthetic, over-saturated, and canonical
+[28, 34]. A recent work [32] has elucidated that the cause
+of diffusion models generating poor samples without CFG
+may be rooted in the mean squared error (MSE) loss objective. It has also demonstrated the use of perceptual loss
+can better learn the real data distribution. We hypothesize
+that adversarial training can be viewed as an extension of
+this work, where it does not have the MSE issue and the
+10discriminator is a learnable, in-the-loop, perceptual critic.
+This helps the generator to learn distributions closer to the
+real training data.
+5.7. The Cause of Structural Degradation
+We take the one-step image model and interpolate the input
+noise z to generate latent traversal videos. Unlike GAN
+models which normally have a low-dimensional noise z,
+our model has a very high-dimensional z ∈ Rt′ ×h′ ×w′×c′
+.
+We find interpolation on the high-dimensional z still produces traversal videos with semantic morphing. Compared to the diffusion model which switches between modes
+very quickly, our one-step generation model has a much
+smoother transition between modes. This is likely because
+the one-step model effectively is much shallower in depth,
+has less nonlinearity, and has a lower capacity for making
+drastic changes. This effect has also been observed by a
+prior work [35]. The interpolation videos are available on
+our website for visualization.
+Mode A Transitioning Mode B
+Figure 11. Latent interpolation reveals that poor structural integrity happens because the generator has limited capacity to make
+sharp switches between modes.
+We hypothesize the generator being under-capacitated is
+one of the main causes of the degradation in structural integrity. As Figure 11 shows, we find that structural incorrectness often occurs during the transition between modes.
+This negatively affects the text alignment, as hallucinations
+may occur – for instance, one object might appear as two
+during the transition phase. The training loss supports this
+hypothesis, where the discriminator can always differentiate
+before convergence. We aim to address this issue in future
+works.
+5.8. Analysis of Text Alignment Degradation
+Previous research has reported that diffusion models with
+classifier-free guidance can significantly increase text alignment to an extent where the samples can look canonical
+[28, 32]. Adversarial post-training against real data makes
+the generated distribution closer to the real distribution, yet
+the real distribution itself often has worse text alignment
+[59]. Our training dataset has already employed re-captions
+to improve text alignments. Therefore, our one-step generation model still has very acceptable text alignment, though
+not as strong as the classifier-free guidance.
+We have explored several techniques to improve text
+alignment but found them to be ineffective. These include:
+(1) providing the discriminator with unmatched conditional
+pairs to penalize misalignment, as proposed by [23, 58].
+However, we choose not to adopt this approach because our
+early experiments showed minimal improvements; (2) incorporating CLIP loss [51]. Our experiments indicate that
+it could negatively impact visual fidelity, leading to poorer
+details and the introduction of artifacts. We leave further
+investigation to future research.
+6. Conclusion and Limitations
+In this paper, we propose Adversarial Post-Training (APT)
+to accelerate the diffusion model for single-step generation
+of both image and video. Our method incorporates several enhancements to the discriminator, along with an approximate R1 regularization, both of which are crucial for
+stabilizing large-scale adversarial training. By employing
+the pre-trained diffusion model for continuous post-training
+against real data, rather than using a distillation teacher
+to generate the target, our one-step generation model can
+achieve visual fidelity comparable to or even better than the
+original pre-trained diffusion model. However, it still suffers from degradation in structural integrity and text alignment.
+To the best of our knowledge, we present the first
+proof of concept for generating high-resolution videos
+(1280×720 24fps) in a single step. However, we identify
+several limitations in the current approach. First, due to
+computational constraints, we were only able to train the
+model to verify video generation for up to two seconds.
+Second, we observed that APT can negatively impact text
+alignment, which we aim to address in future works.
+Acknowledgment
+We thank Jiashi Li, Zuquan Song, and Junru Zheng for managing the compute infrastructure. We thank Yanzuo Lu,
+Meng Guo, Weiying Sun, Shanshan Liu and Yameng Li for
+image evaluation. We thank Ruiqi Xia, Donglei Ji, Juntian
+Chen, and Songyan Yao for video evaluation.
+11References
+[1] James Betker, Gabriel Goh, Li Jing, Tim Brooks, Jianfeng
+Wang, Linjie Li, Long Ouyang, Juntang Zhuang, Joyce Lee,
+Yufei Guo, et al. Improving image generation with better
+captions. https://cdn.openai.com/papers/dall-e-3.pdf, 2023.
+2
+[2] A. Blattmann, Tim Dockhorn, Sumith Kulal, Daniel
+Mendelevitch, Maciej Kilian, and Dominik Lorenz. Stable video diffusion: Scaling latent video diffusion models
+to large datasets. ArXiv, abs/2311.15127, 2023. 2
+[3] Andrew Brock, Jeff Donahue, and Karen Simonyan. Large
+scale GAN training for high fidelity natural image synthesis. In International Conference on Learning Representations, 2019. 3
+[4] Tim Brooks, Bill Peebles, Connor Holmes, Will DePue,
+Yufei Guo, Li Jing, David Schnurr, Joe Taylor, Troy Luhman, Eric Luhman, et al. Video generation models as world
+simulators. https://openai.com/research/video-generationmodelsas-world-simulators, 2024. 2
+[5] Cl ́ement Chadebec, Onur Tasar, Eyal Benaroche, and Benjamin Aubin. Flash diffusion: Accelerating any conditional
+diffusion model for few steps image generation. ArXiv,
+abs/2406.02347, 2024. 3
+[6] Dar-Yen Chen, Hmrishav Bandyopadhyay, Kai Zou, and
+Yi-Zhe Song. Nitrofusion: High-fidelity single-step diffusion through dynamic adversarial training. arXiv preprint
+arXiv:2412.02030, 2024. 2, 3, 5, 8, 9, 16
+[7] Junsong Chen, Jincheng Yu, Chongjian Ge, Lewei Yao, Enze
+Xie, Yue Wu, Zhongdao Wang, James T. Kwok, Ping Luo,
+Huchuan Lu, and Zhenguo Li. Pixart-α: Fast training of diffusion transformer for photorealistic text-to-image synthesis.
+ArXiv, abs/2310.00426, 2023. 2
+[8] Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin.
+Training deep nets with sublinear memory cost. ArXiv,
+abs/1604.06174, 2016. 3, 5
+[9] Aidan Clark, Jeff Donahue, and Karen Simonyan. Efficient video generation on complex datasets. ArXiv,
+abs/1907.06571, 2019. 3
+[10] Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. ArXiv, abs/2307.08691, 2023.
+3, 5
+[11] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher R ́e. Flashattention: Fast and memory-efficient exact attention with io-awareness. Advances in Neural Information
+Processing Systems, 35:16344–16359, 2022. 3, 5
+[12] Mostafa Dehghani, Basil Mustafa, Josip Djolonga, Jonathan
+Heek, Matthias Minderer, Mathilde Caron, Andreas Steiner,
+Joan Puigcerver, Robert Geirhos, Ibrahim M Alabdulmohsin, et al. Patch n’pack: Navit, a vision transformer for
+any aspect ratio and resolution. Advances in Neural Information Processing Systems, 36, 2024. 4
+[13] Patrick Esser, Sumith Kulal, A. Blattmann, Rahim Entezari,
+Jonas Muller, Harry Saini, Yam Levi, Dominik Lorenz, Axel
+Sauer, Frederic Boesel, Dustin Podell, Tim Dockhorn, Zion
+English, Kyle Lacey, Alex Goodwin, Yannik Marek, and
+Robin Rombach. Scaling rectified flow transformers for
+high-resolution image synthesis. ArXiv, abs/2403.03206,
+2024. 2, 4, 9, 16
+[14] FLUX. FLUX.1-dev. https://huggingface.co/
+black-forest-labs/FLUX.1-dev, . 2, 5, 9, 16
+[15] FLUX. FLUX.1-schnell. https://huggingface.co/
+black-forest-labs/FLUX.1-schnell, . 5, 8, 9,
+16
+[16] Ian J. Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing
+Xu, David Warde-Farley, Sherjil Ozair, Aaron C. Courville,
+and Yoshua Bengio. Generative adversarial nets. In Neural
+Information Processing Systems, 2014. 2, 3
+[17] Yuwei Guo, Ceyuan Yang, Anyi Rao, Zhengyang Liang,
+Yaohui Wang, Yu Qiao, Maneesh Agrawala, Dahua Lin, and
+Bo Dai. Animatediff: Animate your personalized text-toimage diffusion models without specific tuning. International Conference on Learning Representations, 2024. 2, 3
+[18] Martin Heusel, Hubert Ramsauer, Thomas Unterthiner,
+Bernhard Nessler, and Sepp Hochreiter. Gans trained by a
+two time-scale update rule converge to a local nash equilibrium. Advances in neural information processing systems,
+30, 2017. 8, 16
+[19] Geoffrey Hinton. Distilling the knowledge in a neural network. arXiv preprint arXiv:1503.02531, 2015. 2
+[20] Jonathan Ho and Tim Salimans. Classifier-free diffusion
+guidance. In NeurIPS 2021 Workshop on Deep Generative
+Models and Downstream Applications, 2021. 4, 5, 10, 16
+[21] Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. Advances in neural information
+processing systems, 33:6840–6851, 2020. 2
+[22] Nick Huang, Aaron Gokaslan, Volodymyr Kuleshov, and
+James Tompkin. The GAN is dead; long live the GAN! a
+modern GAN baseline. In The Thirty-eighth Annual Conference on Neural Information Processing Systems, 2024. 3
+[23] Minguk Kang, Jun-Yan Zhu, Richard Zhang, Jaesik Park,
+Eli Shechtman, Sylvain Paris, and Taesung Park. Scaling
+up gans for text-to-image synthesis. In Proceedings of the
+IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2023. 3, 10, 11
+[24] Minguk Kang, Richard Zhang, Connelly Barnes, Sylvain
+Paris, Suha Kwak, Jaesik Park, Eli Shechtman, Jun-Yan Zhu,
+and Taesung Park. Distilling Diffusion Models into Conditional GANs. In European Conference on Computer Vision
+(ECCV), 2024. 3
+[25] Tero Karras, Samuli Laine, and Timo Aila. A style-based
+generator architecture for generative adversarial networks.
+2019 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), pages 4396–4405, 2018. 3
+[26] Tero Karras, Samuli Laine, Miika Aittala, Janne Hellsten,
+Jaakko Lehtinen, and Timo Aila. Analyzing and improving
+the image quality of stylegan. 2020 IEEE/CVF Conference
+on Computer Vision and Pattern Recognition (CVPR), pages
+8107–8116, 2019.
+[27] Tero Karras, Miika Aittala, Samuli Laine, Erik H ̈ark ̈onen,
+Janne Hellsten, Jaakko Lehtinen, and Timo Aila. Alias-free
+generative adversarial networks. In Neural Information Processing Systems, 2021. 3
+12[28] Tero Karras, Miika Aittala, Tuomas Kynk ̈a ̈anniemi, Jaakko
+Lehtinen, Timo Aila, and Samuli Laine. Guiding a diffusion
+model with a bad version of itself. In The Thirty-eighth Annual Conference on Neural Information Processing Systems,
+2024. 10, 11
+[29] Diederik P. Kingma and Jimmy Ba. Adam: A method for
+stochastic optimization. CoRR, abs/1412.6980, 2014. 5
+[30] Jonas Kohler, Albert Pumarola, Edgar Sch ̈onfeld, Artsiom
+Sanakoyeu, Roshan Sumbaly, Peter Vajda, and Ali K. Thabet. Imagine flash: Accelerating emu diffusion models with
+backward distillation. ArXiv, abs/2405.05224, 2024. 3
+[31] Weijie Kong, Qi Tian, Zijian Zhang, Rox Min, Zuozhuo Dai,
+Jin Zhou, Jiangfeng Xiong, Xin Li, Bo Wu, Jianwei Zhang,
+et al. Hunyuanvideo: A systematic framework for large video
+generative models. arXiv preprint arXiv:2412.03603, 2024.
+2
+[32] Shanchuan Lin and Xiao Yang. Diffusion model with perceptual loss. ArXiv, abs/2401.00110, 2023. 10, 11
+[33] Shanchuan Lin and Xiao Yang. Animatediff-lightning:
+Cross-model diffusion distillation. ArXiv, abs/2403.12706,
+2024. 2, 3, 4
+[34] Shanchuan Lin, Bingchen Liu, Jiashi Li, and Xiao Yang.
+Common diffusion noise schedules and sample steps are
+flawed. 2024 IEEE/CVF Winter Conference on Applications
+of Computer Vision (WACV), pages 5392–5399, 2023. 10
+[35] Shanchuan Lin, Anran Wang, and Xiao Yang. Sdxllightning: Progressive adversarial diffusion distillation.
+ArXiv, abs/2402.13929, 2024. 2, 3, 4, 5, 8, 9, 11, 16
+[36] Tsung-Yi Lin, Michael Maire, Serge J. Belongie, James
+Hays, Pietro Perona, Deva Ramanan, Piotr Doll ́ar, and
+C. Lawrence Zitnick. Microsoft coco: Common objects in
+context. In European Conference on Computer Vision, 2014.
+8, 16
+[37] Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matthew Le. Flow matching for generative modeling. In The Eleventh International Conference on
+Learning Representations, 2023. 4
+[38] Xingchao Liu, Chengyue Gong, and qiang liu. Flow straight
+and fast: Learning to generate and transfer data with rectified
+flow. In The Eleventh International Conference on Learning
+Representations, 2023. 2
+[39] Xingchao Liu, Xiwen Zhang, Jianzhu Ma, Jian Peng, et al.
+Instaflow: One step is enough for high-quality diffusionbased text-to-image generation. In The Twelfth International
+Conference on Learning Representations, 2023. 2
+[40] Cheng Lu and Yang Song. Simplifying, stabilizing
+and scaling continuous-time consistency models. ArXiv,
+abs/2410.11081, 2024. 2
+[41] Simian Luo, Yiqin Tan, Longbo Huang, Jian Li, and
+Hang Zhao. Latent consistency models: Synthesizing
+high-resolution images with few-step inference. ArXiv,
+abs/2310.04378, 2023. 2, 3
+[42] Simian Luo, Yiqin Tan, Suraj Patil, Daniel Gu, Patrick von
+Platen, Apolin’ario Passos, Longbo Huang, Jian Li, and
+Hang Zhao. Lcm-lora: A universal stable-diffusion acceleration module. ArXiv, abs/2311.05556, 2023. 2, 3
+[43] Weijian Luo, Tianyang Hu, Shifeng Zhang, Jiacheng Sun,
+Zhenguo Li, and Zhihua Zhang. Diff-instruct: A universal
+approach for transferring knowledge from pre-trained diffusion models. Advances in Neural Information Processing
+Systems, 36, 2024. 3
+[44] Yihong Luo, Xiaolong Chen, and Jing Tang. You only sample once: Taming one-step text-to-image synthesis by selfcooperative diffusion gans. ArXiv, abs/2403.12931, 2024. 3
+[45] Lars M. Mescheder, Andreas Geiger, and Sebastian
+Nowozin. Which training methods for gans do actually converge? In International Conference on Machine Learning,
+2018. 3, 5
+[46] Nvidia-Apex. Nvidia Apex. https://github.com/
+NVIDIA/apex. 3, 5
+[47] Gaurav Parmar, Richard Zhang, and Jun-Yan Zhu. On buggy
+resizing libraries and surprising subtleties in fid calculation.
+ArXiv, abs/2104.11222, 2021. 16
+[48] William Peebles and Saining Xie. Scalable diffusion models
+with transformers. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 4195–4205,
+2023. 2
+[49] Dustin Podell, Zion English, Kyle Lacey, A. Blattmann, Tim
+Dockhorn, Jonas Muller, Joe Penna, and Robin Rombach.
+Sdxl: Improving latent diffusion models for high-resolution
+image synthesis. ArXiv, abs/2307.01952, 2023. 2, 9, 16
+[50] Adam Polyak, Amit Zohar, Andrew Brown, et al. Movie gen:
+A cast of media foundation models. ArXiv, abs/2410.13720,
+2024. 2
+[51] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya
+Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,
+Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen
+Krueger, and Ilya Sutskever. Learning transferable visual
+models from natural language supervision. In International
+Conference on Machine Learning, 2021. 8, 11, 16
+[52] Aditya Ramesh, Prafulla Dhariwal, Alex Nichol, Casey Chu,
+and Mark Chen. Hierarchical text-conditional image generation with clip latents. ArXiv, abs/2204.06125, 2022. 2
+[53] Yuxi Ren, Xin Xia, Yanzuo Lu, Jiacheng Zhang, Jie Wu, Pan
+Xie, Xing Wang, and Xuefeng Xiao. Hyper-SD: Trajectory
+segmented consistency model for efficient image synthesis.
+In The Thirty-eighth Annual Conference on Neural Information Processing Systems, 2024. 2, 3, 5, 8, 9, 16
+[54] Robin Rombach, A. Blattmann, Dominik Lorenz, Patrick
+Esser, and Bj ̈orn Ommer. High-resolution image synthesis
+with latent diffusion models. 2022 IEEE/CVF Conference
+on Computer Vision and Pattern Recognition (CVPR), pages
+10674–10685, 2021. 2, 4
+[55] Kevin Roth, Aur ́elien Lucchi, Sebastian Nowozin, and
+Thomas Hofmann. Stabilizing training of generative adversarial networks through regularization. In Neural Information Processing Systems, 2017. 3, 5
+[56] Chitwan Saharia, William Chan, Saurabh Saxena, Lala
+Li, Jay Whang, Emily L. Denton, Seyed Kamyar Seyed
+Ghasemipour, Burcu Karagol Ayan, Seyedeh Sara Mahdavi, Raphael Gontijo Lopes, Tim Salimans, Jonathan Ho,
+David J. Fleet, and Mohammad Norouzi. Photorealistic textto-image diffusion models with deep language understanding. ArXiv, abs/2205.11487, 2022. 2, 8
+13[57] Tim Salimans and Jonathan Ho. Progressive distillation
+for fast sampling of diffusion models. arXiv preprint
+arXiv:2202.00512, 2022. 2
+[58] Axel Sauer, Tero Karras, Samuli Laine, Andreas Geiger, and
+Timo Aila. Stylegan-t: Unlocking the power of gans for fast
+large-scale text-to-image synthesis. In International Conference on Machine Learning, 2023. 11
+[59] Axel Sauer, Frederic Boesel, Tim Dockhorn, Andreas
+Blattmann, Patrick Esser, and Robin Rombach. Fast highresolution image synthesis with latent adversarial diffusion
+distillation. In SIGGRAPH Asia 2024 Conference Papers,
+pages 1–11, 2024. 2, 3, 4, 5, 8, 9, 11, 16
+[60] Axel Sauer, Dominik Lorenz, Andreas Blattmann, and Robin
+Rombach. Adversarial diffusion distillation. In European
+Conference on Computer Vision, pages 87–103. Springer,
+2025. 2, 3, 5, 8, 9, 16
+[61] Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
+Pradeep Ramani, and Tri Dao. Flashattention-3: Fast and accurate attention with asynchrony and low-precision. ArXiv,
+abs/2407.08608, 2024. 3, 5
+[62] Yichun Shi, Peng Wang, Jianglong Ye, Mai Long, Kejie Li,
+and X. Yang. Mvdream: Multi-view diffusion for 3d generation. ArXiv, abs/2308.16512, 2023. 3
+[63] Ivan Skorokhodov, S. Tulyakov, and Mohamed Elhoseiny.
+Stylegan-v: A continuous video generator with the price, image quality and perks of stylegan2. 2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR),
+pages 3616–3626, 2021. 2, 3
+[64] Yang Song and Prafulla Dhariwal. Improved techniques for
+training consistency models. In The Twelfth International
+Conference on Learning Representations, 2024. 2, 4
+[65] Yang Song, Jascha Narain Sohl-Dickstein, Diederik P.
+Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole.
+Score-based generative modeling through stochastic differential equations. ArXiv, abs/2011.13456, 2020. 2
+[66] Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya
+Sutskever. Consistency models. In International Conference
+on Machine Learning, 2023. 2, 4
+[67] Christian Szegedy, Vincent Vanhoucke, Sergey Ioffe,
+Jonathon Shlens, and Zbigniew Wojna. Rethinking the inception architecture for computer vision. 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR),
+pages 2818–2826, 2015. 16
+[68] Yu Tian, Jian Ren, Menglei Chai, Kyle Olszewski, Xi Peng,
+Dimitris N. Metaxas, and S. Tulyakov. A good image generator is what you need for high-resolution video synthesis.
+ArXiv, abs/2104.15069, 2021. 3
+[69] Patrick von Platen, Suraj Patil, Anton Lozhkov, Pedro
+Cuenca, Nathan Lambert, Kashif Rasul, Mishig Davaadorj,
+Dhruv Nair, Sayak Paul, William Berman, Yiyi Xu, Steven
+Liu, and Thomas Wolf. Diffusers: State-of-the-art diffusion models. https://github.com/huggingface/
+diffusers, 2022. 5, 16
+[70] Fu-Yun Wang, Zhaoyang Huang, Weikang Bian, Xiaoyu Shi,
+Keqiang Sun, Guanglu Song, Yu Liu, and Hongsheng Li.
+Animatelcm: Computation-efficient personalized style video
+generation without personalized video data. In SIGGRAPH
+Asia Technical Communications, 2024. 2, 3
+[71] Jiuniu Wang, Hangjie Yuan, Dayou Chen, Yingya Zhang,
+Xiang Wang, and Shiwei Zhang. Modelscope text-to-video
+technical report. ArXiv, abs/2308.06571, 2023. 2, 3
+[72] Weimin Wang, Jiawei Liu, Zhijie Lin, Jiangqiao Yan, Shuo
+Chen, Chetwin Low, Tuyen Hoang, Jie Wu, Jun Hao Liew,
+Hanshu Yan, Daquan Zhou, and Jiashi Feng. Magicvideov2: Multi-stage high-aesthetic video generation. ArXiv,
+abs/2401.04468, 2024. 2
+[73] Zhendong Wang, Huangjie Zheng, Pengcheng He, Weizhu
+Chen, and Mingyuan Zhou. Diffusion-gan: Training gans
+with diffusion. ArXiv, abs/2206.02262, 2022. 3
+[74] Zhengyi Wang, Cheng Lu, Yikai Wang, Fan Bao, Chongxuan
+Li, Hang Su, and Jun Zhu. Prolificdreamer: High-fidelity and
+diverse text-to-3d generation with variational score distillation. ArXiv, abs/2305.16213, 2023. 3
+[75] Yanwu Xu, Yang Zhao, Zhisheng Xiao, and Tingbo Hou.
+Ufogen: You forward once large scale text-to-image generation via diffusion gans. 2024 IEEE/CVF Conference on
+Computer Vision and Pattern Recognition (CVPR), pages
+8196–8206, 2023. 4
+[76] Yanwu Xu, Yang Zhao, Zhisheng Xiao, and Tingbo Hou.
+Ufogen: You forward once large scale text-to-image generation via diffusion gans. 2024 IEEE/CVF Conference on
+Computer Vision and Pattern Recognition (CVPR), pages
+8196–8206, 2023. 3, 10
+[77] Hanshu Yan, Xingchao Liu, Jiachun Pan, Jun Hao Liew,
+Qiang Liu, and Jiashi Feng. Perflow: Piecewise rectified flow as universal plug-and-play accelerator. ArXiv,
+abs/2405.07510, 2024. 2
+[78] Tianwei Yin, Michael Gharbi, Richard Zhang, Eli Shechtman, Fr ́edo Durand, William T. Freeman, and Taesung Park.
+One-step diffusion with distribution matching distillation.
+2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), pages 6613–6623, 2023. 3
+[79] Tianwei Yin, Michael Gharbi, Taesung Park, Richard Zhang,
+Eli Shechtman, Fr ́edo Durand, and William T. Freeman. Improved distribution matching distillation for fast image synthesis. ArXiv, abs/2405.14867, 2024. 2, 3, 5, 8, 9, 16
+[80] Tianwei Yin, Qiang Zhang, Richard Zhang, William T Freeman, Fredo Durand, Eli Shechtman, and Xun Huang. From
+slow bidirectional to fast causal video generators. arXiv
+preprint arXiv:2412.07772, 2024. 2, 3
+[81] Jiahui Yu, Yuanzhong Xu, Jing Yu Koh, Thang Luong, Gunjan Baid, Zirui Wang, Vijay Vasudevan, Alexander Ku, Yinfei Yang, Burcu Karagol Ayan, Ben Hutchinson, Wei Han,
+Zarana Parekh, Xin Li, Han Zhang, Jason Baldridge, and
+Yonghui Wu. Scaling autoregressive models for content-rich
+text-to-image generation. Trans. Mach. Learn. Res., 2022,
+2022. 8
+[82] Sihyun Yu, Jihoon Tack, Sangwoo Mo, Hyunsu Kim, Junho
+Kim, Jung-Woo Ha, and Jinwoo Shin. Generating videos
+with dynamics-aware implicit generative adversarial networks. ArXiv, abs/2202.10571, 2022. 3
+[83] Yuanhao Zhai, Kevin Qinghong Lin, Zhengyuan Yang, Linjie Li, Jianfeng Wang, Chung-Ching Lin, David Doermann, Junsong Yuan, and Lijuan Wang. Motion consistency model: Accelerating video diffusion with disentan-
+14gled motion-appearance distillation. ArXiv, abs/2406.06890,
+2024. 2, 3
+[84] Yanli Zhao, Andrew Gu, Rohan Varma, Liangchen Luo,
+Chien chin Huang, Min Xu, Less Wright, Hamid Shojanazeri, Myle Ott, Sam Shleifer, Alban Desmaison, Can Balioglu,
+Bernard Nguyen, Geeta Chauhan, Yuchen Hao, and Shen Li.
+Pytorch fsdp: Experiences on scaling fully sharded data parallel. Proc. VLDB Endow., 16:3848–3860, 2023. 3, 5
+[85] Daquan Zhou, Weimin Wang, Hanshu Yan, Weiwei Lv,
+Yizhe Zhu, and Jiashi Feng. Magicvideo: Efficient
+video generation with latent diffusion models. ArXiv,
+abs/2211.11018, 2022. 2
+15A. Quantitative Metrics
+Following the previous works [6, 35, 60, 79], we calculate
+Fr ́echet Inception Distance (FID) [18], Patch Fr ́echet Inception Distance (PFID) [35], and CLIP score [51] on COCO
+dataset [36]. We notice some of the works use COCO-5K
+[6, 60] while others use COCO-10K [35, 79]. We provide both in Tables 5 and 6. Specifically, we take the first
+5,000 and 10,000 captions from the COCO 2014 validation dataset as the generation prompts. FID is calculated
+between the generated images and the ground-truth COCO
+images. The ground-truth images are cropped to a square
+aspect ratio before resizing to 299px for the inception network [67]. Resizing is done properly with established library [47]. Patch FID (PFID) metrics [35, 79] center-crops
+299px patches without resizing to measure image details.
+For 512px models, the results are bilinear upsampled to
+1024px before center-crop following prior work [35]. For
+the CLIP score, we follow the previous works [60] to use the
+laion/CLIP-ViT-g-14-laion2B-s12B-b42K model. We use
+each model’s default CFG [20] as configured in diffusers
+[69], e.g. FLUX uses 3.5. Our diffusion model uses 7.5
+CFG.
+We find that the metrics can be far off from the model’s
+actual performance. For example, FLUX 1-step surpasses
+FLUX 25-step in all metrics. However, this strongly contradicts our human perception and evaluation in Table 1, and
+our observation that FLUX 1-step has visible degradation
+in visual quality and structural integrity. Furthermore, the
+metrics suggest that SDXL 25-step is better than FLUX 25step in all metrics. This also contradicts our human evaluation in Table 3 and our observation that SDXL should have
+a weaker performance than FLUX.
+We notice that most previous diffusion distillation publications [6, 35, 53, 59, 60] are conducted on the SDXL
+model. The metrics within the SDXL family of models appear more reasonable, potentially concealing the issue. Yet,
+this does not mean that the metrics are valid within the same
+architecture family of models, as the metrics wrongly identify FLUX 1-step as being better than FLUX 25-step.
+Therefore, we primarily rely on human evaluations for
+our work. We caution researchers to interpret these metrics
+carefully, and we leave the exploration for better metrics to
+future works.
+B. Inference Speed
+Table 7 shows the inference speed of our model on different
+numbers of H100 GPUs with parallelization. Our model
+can generate a 1280×720 24fps 2-second video in 6.03s on
+a single H100 GPU. With 8 H100 GPUs, it can achieve realtime. More optimization can be applied to make it more
+efficient.
+Method Steps FID↓ PFID↓ CLIP↑
+FLUX-Dev [14] 25 31.8 38.7 32.9
+FLUX-Schnell [15] 1 24.9 30.0 33.7
+SD3.5-Large [13] 25 25.1 30.8 33.8
+SD3.5-Turbo [59] 1 61.6 174.5 30.4
+SDXL [49] 25 25.1 28.7 33.9
+SDXL-DMD2 [79] 1 24.1 33.0 34.1
+SDXL-Hyper [53] 1 36.9 41.8 33.1
+SDXL-Lightning [35] 1 28.9 36.9 31.9
+SDXL-Nitro-Realism [6] 1 26.4 32.8 33.9
+SDXL-Turbo [60] (512px) 1 28.4 66.0 33.8
+APT (Ours) 25 26.9 30.6 33.2
+1 27.9 34.6 32.3
+Table 5. Quantitative metrics on COCO5K across different models and methods. We find the metrics inaccurately capture the actual performance of the model. Discussion are provided in Appendix A.
+Method Steps FID↓ PFID↓ CLIP↑
+FLUX-Dev [14] 25 26.3 32.8 32.9
+FLUX-Schnell [15] 1 18.8 23.7 33.7
+SD3.5-Large [13] 25 19.2 23.7 33.8
+SD3.5-Turbo [59] 1 55.7 170.9 30.4
+SDXL [49] 25 19.2 22.5 33.9
+SDXL-DMD2 [79] 1 18.1 26.2 34.0
+SDXL-Hyper [53] 1 31.4 35.3 33.2
+SDXL-Lightning [35] 1 23.4 30.4 31.9
+SDXL-Nitro-Realism [6] 1 20.2 26.2 33.9
+SDXL-Turbo [60] (512px) 1 22.8 35.7 33.8
+APT (Ours) 25 20.7 24.7 33.1
+1 22.1 28.5 32.3
+Table 6. Quantitative metrics on COCO10K. The metrics also inaccurately capture the actual performance of the model. Discussion are provided in Appendix A.
+# of H100 Component Seconds
+1
+Text Encoder 0.28
+DiT 2.65
+VAE 3.10
+Total 6.03
+4
+Text Encoder (no parallelization) 0.28
+DiT 0.73
+VAE 1.19
+Total 2.20
+8
+Text Encoder (no parallelization) 0.28
+DiT 0.50
+VAE (only 4-GPU parallelization) 1.19
+Total 1.97
+Table 7. Inference speed under different numbers of H100 GPUs
+for one-step two-second 1280×720 24fps video generation.
+16C. Additional Results
+We show additional non-cherry-picked one-step image generation results in Figure 12. The prompts are the first 12 captions
+from the COCO 2014 validation set. More image and video results are available on our website (https://seaweed-apt.com).
+(a) a shoe rack with some shoes and a dog sleeping on them (b) The back tire of an old style motorcycle is resting in a metal stand.
+(c) A puppy rests on the street next to a bicycle. (d) Bunk bed with a narrow shelf sitting underneath it.
+Figure 12. One-step image generation results. No cherry-picking.
+17(e) a giraffe in a enclosed area is watched by some people (f) A living area with a television and a table
+(g) Several birds are sitting on small tree branches. (h) A kitchen with a slanted ceiling and skylight.
+Figure 12. One-step image generation results. No cherry-picking.
+18(i) A baseball player for the Chicago Cubs stands at home plate. (j) A table full of food such as peas and carrots, bread, salad and gravy.
+(k) a sink with running water a mirror and a Godzilla toothbrush holder (l) The group of friends is enjoying playing the video games.
+Figure 12. One-step image generation results. No cherry-picking.
+19
