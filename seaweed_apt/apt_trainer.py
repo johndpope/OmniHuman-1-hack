@@ -386,7 +386,7 @@ if __name__ == "__main__":
     parser.add_argument("--device_id", type=int, default=0, help="CUDA device ID (for original model)")
     parser.add_argument("--consistency_path", type=str, default="", help="Path to pretrained consistency model (optional)")
     parser.add_argument("--use_wandb", type=str2bool, default=False, help="Whether to use Weights & Biases")
-    parser.add_argument("--wandb_project", type=str, default="seaweed-apt-training", help="WandB project name")
+    parser.add_argument("--wandb_project", type=str, default="seaweed-apt-stage2", help="WandB project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
     parser.add_argument("--config_file", type=str, default=None, help="Path to OmegaConf config file")
     args = parser.parse_args()

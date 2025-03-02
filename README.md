@@ -1,6 +1,16 @@
-This paper builds off seaweed APT. so we have to implement / train this stage 0 first.
+# How you can help - 
 
-# Status (Seaweed-APT)
+Start an ai business -> Apply for credits -> hook me up
+
+Google for Startups Cloud Program
+https://cloud.google.com/startup 
+Financial benefits · Up to $200,000 USD (up to $350,000 USD for AI startups) in credits;
+
+We can use this for training
+https://github.com/johndpope/vertex-jumpstart
+
+
+# Status - Implement consistency distillation training (Seaweed-APT)
 
 I'm attempting to leverage wan2.1 as base model instead of sd3.5
 https://github.com/johndpope/OmniHuman-1-hack/tree/main/seaweed_apt
@@ -12,9 +22,12 @@ https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-480P (text to video)
 https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P (image to video)
 
 
-DRAFTED - stage 1 of 2 
+DRAFTED - stage 1 of 2 (yet to complete a training pass)
 https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/distilled_trainer.py
-
+```shell
+cd seaweed_apt
+python  distilled_trainer.py   --checkpoint_dir ./Wan2.1-T2V-14B
+```
 
 DRAFTED - stage 2 of 2
 https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/apt_trainer.py
