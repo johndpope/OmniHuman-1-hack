@@ -208,7 +208,7 @@ if __name__ == "__main__":
     from accelerate import Accelerator
     
     parser = argparse.ArgumentParser(description="Train consistency distillation for Wan")
-    parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to Wan model checkpoints")
+    parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to Wan T2V model checkpoints")
     parser.add_argument("--output_dir", type=str, default="./output", help="Output directory for saving checkpoints")
     parser.add_argument("--device_id", type=int, default=0, help="CUDA device ID (for original model)")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     parser.add_argument("--cfg_scale", type=float, default=7.5, help="Classifier-free guidance scale")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--use_wandb", type=str2bool, default=False, help="Whether to use Weights & Biases")
-    parser.add_argument("--wandb_project", type=str, default="wan-consistency-distillation", help="WandB project name")
+    parser.add_argument("--wandb_project", type=str, default="seaweed-apt", help="WandB project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
     parser.add_argument("--config_file", type=str, default="./config.yaml", help="Path to OmegaConf config file")
     parser.add_argument("--save_interval", type=int, default=10, help="Save checkpoint interval (steps)")
