@@ -1,43 +1,41 @@
-# How you can help - 
+# How You Can Help
 
-Start an ai business -> Apply for credits -> hook me up
+## Start an AI Business
+1. **Apply for Credits**
+   - **Google for Startups Cloud Program**: [https://cloud.google.com/startup](https://cloud.google.com/startup)
+   - Financial benefits: Up to $200,000 USD (up to $350,000 USD for AI startups) in credits
+   - We can use this for training
+   - Reference implementation: [https://github.com/johndpope/vertex-jumpstart](https://github.com/johndpope/vertex-jumpstart)
 
-Google for Startups Cloud Program
-https://cloud.google.com/startup 
-Financial benefits · Up to $200,000 USD (up to $350,000 USD for AI startups) in credits;
+## Status: Implementing Consistency Distillation Training (Seaweed-APT)
 
-We can use this for training
-https://github.com/johndpope/vertex-jumpstart
+I'm attempting to leverage Wan2.1 as the base model instead of SD3.5. If successful, this would yield a distilled teacher/student diffusion in 1 step.
 
+**Note**: There are many similar models being developed - [https://arxiv.org/html/2502.15681v1](https://arxiv.org/html/2502.15681v1)
 
-# Status - Implement consistency distillation training (Seaweed-APT)
+### Current Challenge
+I'm not 100% confident in combining these two discrete models:
+- [Wan-AI/Wan2.1-T2V-14B-480P](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-480P) (text to video)
+- [Wan-AI/Wan2.1-I2V-14B-480P](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P) (image to video)
 
-I'm attempting to leverage wan2.1 as base model instead of sd3.5
-https://github.com/johndpope/OmniHuman-1-hack/tree/main/seaweed_apt
+### Progress
+**DRAFTED - Stage 1 of 2** (yet to complete a training pass)
+- Implementation: [distilled_trainer.py](https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/distilled_trainer.py)
 
-If successful - this would yield a distilled teacher / student diffusion in 1 step.
-N.B. there's lots of these models coming soon - https://arxiv.org/html/2502.15681v1
-I'm not 100% on glueing these 2 discrete models together 
-https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-480P (text to video)
-https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P (image to video)
-
-
-DRAFTED - stage 1 of 2 (yet to complete a training pass)
-https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/distilled_trainer.py
 ```shell
-# ~ 18gb https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/main
+# ~ 18GB https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/main
 pip install "huggingface_hub[cli]"
 # huggingface-cli download Wan-AI/I2V-14B-480P --local-dir ./models/I2V-14B-480P
 huggingface-cli download https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B --local-dir ./models/Wan2.1-T2V-1.3B
 cd seaweed_apt
-python  distilled_trainer.py   --checkpoint_dir ../models/Wan2.1-T2V-1.3B
+python distilled_trainer.py --checkpoint_dir ../models/Wan2.1-T2V-1.3B
 ```
 
-DRAFTED - stage 2 of 2
-https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/apt_trainer.py
+**DRAFTED - Stage 2 of 2**
+- Implementation: [apt_trainer.py](https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/apt_trainer.py)
 
-TODO - datasets / dataloaders - in progress
-
+### TODO
+- Datasets / dataloaders - in progress
 
 
 ### Functional Specification: OmniHuman Recreation
