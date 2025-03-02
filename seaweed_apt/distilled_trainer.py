@@ -204,7 +204,7 @@ def train_consistency_distillation(
 
 if __name__ == "__main__":
     import argparse
-    from wan.configs import t2v_14B
+    from wan.configs import t2v_14B,t2v_1_3B
     from accelerate import Accelerator
     
     parser = argparse.ArgumentParser(description="Train consistency distillation for Wan")
@@ -240,7 +240,7 @@ if __name__ == "__main__":
     
     # Initialize original Wan model - not wrapped by accelerator
     original_model = WanT2V(
-        config=t2v_14B,
+        config=t2v_1_3B,#t2v_14B
         checkpoint_dir=args.checkpoint_dir,
         device_id=args.device_id,
         rank=0,
@@ -268,7 +268,7 @@ if __name__ == "__main__":
     # Train consistency model
     distilled_model = train_consistency_distillation(
         original_model=original_model,
-        config=t2v_14B,
+        config=t2v_1_3B ,#t2v_14B
         train_dataloader=train_dataloader,
         checkpoint_dir=args.checkpoint_dir,
         output_dir=args.output_dir,
