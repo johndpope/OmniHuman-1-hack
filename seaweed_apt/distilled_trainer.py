@@ -98,12 +98,13 @@ def train_consistency_distillation(
     distilled_model.train()
     
     # Create T5 text encoder for processing text prompts
-    print(f"Initializing text encoder on {t5_device}...")
+
     from wan.modules.t5 import T5EncoderModel
     from wan.distributed.fsdp import shard_model
     from functools import partial
     shard_fn = partial(shard_model, device_id=0)
     t5_device = torch.device('cpu')
+    print(f"Initializing text encoder on {t5_device}...")
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
         dtype=config.t5_dtype,
