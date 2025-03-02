@@ -4,8 +4,12 @@ This paper builds off seaweed APT. so we have to implement / train this stage 0 
 I focus here - it's using wan2.1 architecture as base model to train seaweed.
 https://github.com/johndpope/OmniHuman-1-hack/tree/main/SeaweedAPT/Wan2.1
 
-If successful - this work would yield a distilled teacher / student diffusion in 1 step.
+If successful - this would yield a distilled teacher / student diffusion in 1 step.
 N.B. there's lots of these models coming soon - https://arxiv.org/html/2502.15681v1
+I'm not 100% on glueing these 2 discrete models together 
+https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-480P (text to video)
+https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P (image to video)
+
 
 DRAFTED - stage 1 of 2 
 https://github.com/johndpope/OmniHuman-1-hack/blob/main/SeaweedAPT/Wan2.1/distilled_trainer.py
@@ -17,11 +21,6 @@ https://github.com/johndpope/OmniHuman-1-hack/blob/main/SeaweedAPT/Wan2.1/apt_tr
 I believe the canonical seaweed derived from sd3.5 but that model is slightly off only 32 layers - not 36.
 
 
-![OmniHuman-Seaweed Architecture](architecture-diagram.svg)
-
-
-
-TODO -> 
 
 
 ### Functional Specification: OmniHuman Recreation
