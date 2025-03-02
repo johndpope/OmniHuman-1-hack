@@ -152,7 +152,7 @@ class SeaweedWanAPTGenerator:
         print("Performing one-step inference...")
         dit_start = time.time()
         
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=self.config.param_dtype):
+        with torch.no_grad(), torch.amp.autocast(dtype=self.config.param_dtype):
             latents = self.model(
                 [noise], 
                 t=torch.ones(1, device=self.device) * self.config.num_train_timesteps,

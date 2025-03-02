@@ -307,7 +307,7 @@ class OmniHumanSeaweedWan(nn.Module):
         )
         
         # Generate video latents with classifier-free guidance
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=self.config.param_dtype):
+        with torch.no_grad(), torch.amp.autocast(dtype=self.config.param_dtype):
             # Unconditional generation (using null text)
             uncond_latents = self.generator(
                 [noise], 

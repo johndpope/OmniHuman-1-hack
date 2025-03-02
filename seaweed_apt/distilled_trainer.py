@@ -15,7 +15,7 @@ from wan.utils.utils import str2bool
 
 def train_consistency_distillation(
     original_model,
-    model_config,
+    config,
     train_dataloader,
     checkpoint_dir,
     output_dir,

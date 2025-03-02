@@ -79,7 +79,7 @@ except Exception:
 # Specific warning suppressions
 warnings.filterwarnings(
     'ignore', 
-    message='torch.cuda.amp.autocast.*',
+    message='torch.amp.autocast.*',
     category=FutureWarning
 )
 warnings.filterwarnings(
