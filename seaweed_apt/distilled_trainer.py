@@ -12,17 +12,8 @@ from accelerate import Accelerator
 from wan.modules.model import WanModel
 from wan.text2video import WanT2V
 from wan.utils.utils import str2bool
+from logger import logger 
 
-
-def get_context(prompts, text_encoder, device):
-    # Process text prompts and ensure they're on the correct device
-    ids, mask = text_encoder.tokenizer(prompts)
-    ids = ids.to(device)
-    mask = mask.to(device)
-    # Get context
-    with torch.no_grad():
-        context = text_encoder.model(ids, mask)
-    return context
 
 def train_consistency_distillation(
     original_model,
@@ -63,7 +54,7 @@ def train_consistency_distillation(
     Returns:
         distilled_model: The trained consistency-distilled model
     """
-    print("Initializing consistency distillation training...")
+    logger.debug("Initializing consistency distillation training...")
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -104,7 +95,7 @@ def train_consistency_distillation(
     from functools import partial
     shard_fn = partial(shard_model, device_id=0)
     t5_device = torch.device('cpu')
-    print(f"Initializing text encoder on {t5_device}...")
+    logger.debug(f"Initializing text encoder on {t5_device}...")
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
         dtype=config.t5_dtype,
@@ -116,7 +107,7 @@ def train_consistency_distillation(
     # Negative prompt for CFG (paper uses fixed negative prompt)
     negative_prompt = config.sample_neg_prompt or ""  # Empty string if not specified
     # EMA setup (paper uses decay rate of 0.995)
-    print("Setting up EMA model...")
+    logger.debug("Setting up EMA model...")
     ema_model = WanModel.from_pretrained(checkpoint_dir)
     ema_model.eval()
     ema_decay = 0.995
@@ -127,31 +118,167 @@ def train_consistency_distillation(
                 target_param.data.mul_(decay).add_(source_param.data, alpha=1 - decay)
     
 
-    # Helper function to process text with proper device management
+    
     def process_text(prompts):
+        """
+        Process text prompts with detailed logging for debugging.
+        """
+        logger.debug(f"Processing text prompts: {prompts[:2]}{'...' if len(prompts) > 2 else ''}")
+        logger.debug(f"Tokenizer type: {type(text_encoder.tokenizer)}")
+        
         # Get token IDs and mask - explicitly request mask to be returned
+        logger.debug("Calling tokenizer with return_mask=True")
         ids, mask = text_encoder.tokenizer(prompts, return_mask=True)
+        logger.debug(f"Tokenizer returned: ids shape={ids.shape}, mask shape={mask.shape}")
         
         # Process on CPU (where text_encoder model is)
         with torch.no_grad():
             # Make sure tokens are on the same device as the model
+            logger.debug(f"Moving tokens to device: {t5_device}")
             ids = ids.to(t5_device)
             mask = mask.to(t5_device)
-            context = text_encoder.model(ids, mask)
             
+            logger.debug(f"Running text encoder model with ids shape={ids.shape}, mask shape={mask.shape}")
+            context = text_encoder.model(ids, mask)
+            logger.debug(f"Text encoder output context shape: {context.shape}")
+        
         # Move output to the target device for further processing
-        return context.to(device)
-    
-    # Training loop
-    step = 0
-    total_loss = 0.0
-    
-    print("Starting training loop...")
+        logger.debug(f"Moving context to device: {device}")
+        result = context.to(device)
+        logger.debug(f"Final context shape: {result.shape}")
+        return result
+
+    # Enhanced training loop with detailed logging
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
+        logger.debug(f"Starting epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
-            print(f"Processing text prompts for batch {batch_idx}")
+            logger.debug(f"Batch {batch_idx}: samples shape={samples.shape}, text_prompts length={len(text_prompts)}")
+            logger.debug(f"Sample text prompt example: {text_prompts[0][:50]}...")
+            
+            # Move samples to device
+            logger.debug(f"Moving samples to device: {device}")
+            samples = samples.to(device)
+            
+            # Process text prompts
+            logger.debug("Processing positive text prompts")
+            context = process_text(text_prompts)
+            logger.debug(f"Positive context shape: {context[0].shape if isinstance(context, list) else context.shape}")
+            
+            logger.debug("Processing negative text prompts")
+            context_null = process_text([negative_prompt] * len(text_prompts))
+            logger.debug(f"Negative context shape: {context_null[0].shape if isinstance(context_null, list) else context_null.shape}")
+            
+            # Generate random noise
+            logger.debug("Generating random noise")
+            noise = torch.randn_like(samples)
+            logger.debug(f"Noise shape: {noise.shape}")
+            
+            # Final timestep for one-step prediction
+            logger.debug("Creating timestep tensor")
+            timestep = torch.ones(samples.shape[0], device=device) * config.num_train_timesteps
+            logger.debug(f"Timestep shape: {timestep.shape}, value: {timestep[0].item()}")
+            
+            # Teacher prediction with CFG
+            logger.debug("Starting teacher model prediction")
+            with torch.no_grad():
+                # Unconditional prediction
+                logger.debug("Running unconditional prediction with original model")
+                v_uncond = original_model(
+                    [noise], 
+                    t=timestep, 
+                    context=context_null, 
+                    seq_len=config.seq_len
+                )[0]
+                logger.debug(f"Unconditional prediction shape: {v_uncond.shape}")
+                
+                # Conditional prediction
+                logger.debug("Running conditional prediction with original model")
+                v_cond = original_model(
+                    [noise], 
+                    t=timestep, 
+                    context=context, 
+                    seq_len=config.seq_len
+                )[0]
+                logger.debug(f"Conditional prediction shape: {v_cond.shape}")
+                
+                # CFG: v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
+                logger.debug(f"Applying classifier-free guidance with scale: {cfg_scale}")
+                v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
+                logger.debug(f"Teacher prediction shape: {v_teacher.shape}")
+            
+            # Student prediction
+            logger.debug("Running student model prediction")
+            v_student = distilled_model(
+                [noise], 
+                t=timestep, 
+                context=context, 
+                seq_len=config.seq_len
+            )[0]
+            logger.debug(f"Student prediction shape: {v_student.shape}")
+            
+            # MSE loss calculation
+            logger.debug("Calculating MSE loss")
+            loss = F.mse_loss(v_student, v_teacher)
+            logger.debug(f"Loss value: {loss.item()}")
+            
+            # Backpropagation
+            logger.debug("Starting backpropagation")
+            accelerator.backward(loss)
+            logger.debug("Completed backpropagation")
+            
+            logger.debug("Updating optimizer")
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            # Update EMA
+            logger.debug("Updating EMA model")
+            update_ema(ema_model, distilled_model, ema_decay)
+            
+            # Update stats
+            total_loss += loss.item()
+            step += 1
+            
+            # Log to wandb
+            if use_wandb and accelerator.is_main_process and batch_idx % 5 == 0:
+                logger.debug("Logging to wandb")
+                wandb.log({
+                    "step": step,
+                    "batch_loss": loss.item(),
+                    "avg_loss": total_loss / (batch_idx + 1),
+                    "epoch": epoch + 1,
+                })
+            
+            # Print progress
+            if accelerator.is_main_process and batch_idx % 10 == 0:
+                avg_loss = total_loss / (batch_idx + 1)
+                logger.debug(f"Progress update: Epoch {epoch+1}, Batch {batch_idx}, Avg Loss: {avg_loss:.6f}")
+                logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {avg_loss:.6f}")
+            
+            # Save checkpoint with EMA weights
+            if step % save_interval == 0 and accelerator.is_main_process:
+                checkpoint_path = f"{output_dir}/consistency_model_step_{step}.pt"
+                logger.debug(f"Saving checkpoint to {checkpoint_path}")
+                unwrapped_ema = accelerator.unwrap_model(ema_model)
+                torch.save(unwrapped_ema.state_dict(), checkpoint_path)
+                logger.debug("Checkpoint saved successfully")
+                logger.debug(f"Saved EMA checkpoint to {checkpoint_path}")
+        
+        # Save epoch checkpoint with EMA weights
+        if accelerator.is_main_process:
+            checkpoint_path = f"{output_dir}/consistency_model_epoch_{epoch+1}.pt"
+            logger.debug(f"Saving epoch checkpoint to {checkpoint_path}")
+            unwrapped_ema = accelerator.unwrap_model(ema_model)
+            torch.save(unwrapped_ema.state_dict(), checkpoint_path)
+            logger.debug("Epoch checkpoint saved successfully")
+            logger.debug(f"Saved EMA epoch checkpoint to {checkpoint_path}")
+        
+        logger.debug(f"Completed epoch {epoch+1}/{num_epochs}")
+        total_loss = 0.0
+        logger.debug(f"Epoch {epoch+1}/{num_epochs}")
+        
+        for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
+            logger.debug(f"Processing text prompts for batch {batch_idx}")
 
             # Process text prompts
             context = process_text(text_prompts)
@@ -218,21 +345,21 @@ def train_consistency_distillation(
             # Print progress
             if accelerator.is_main_process and batch_idx % 10 == 0:
                 avg_loss = total_loss / (batch_idx + 1)
-                print(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {avg_loss:.6f}")
+                logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {avg_loss:.6f}")
             
             # Save checkpoint with EMA weights
             if step % save_interval == 0 and accelerator.is_main_process:
                 checkpoint_path = f"{output_dir}/consistency_model_step_{step}.pt"
                 unwrapped_ema = accelerator.unwrap_model(ema_model)
                 torch.save(unwrapped_ema.state_dict(), checkpoint_path)
-                print(f"Saved EMA checkpoint to {checkpoint_path}")
+                logger.debug(f"Saved EMA checkpoint to {checkpoint_path}")
         
         # Save epoch checkpoint with EMA weights
         if accelerator.is_main_process:
             checkpoint_path = f"{output_dir}/consistency_model_epoch_{epoch+1}.pt"
             unwrapped_ema = accelerator.unwrap_model(ema_model)
             torch.save(unwrapped_ema.state_dict(), checkpoint_path)
-            print(f"Saved EMA epoch checkpoint to {checkpoint_path}")
+            logger.debug(f"Saved EMA epoch checkpoint to {checkpoint_path}")
         
         total_loss = 0.0
     
@@ -241,7 +368,7 @@ def train_consistency_distillation(
         final_path = f"{output_dir}/consistency_model_final.pt"
         unwrapped_ema = accelerator.unwrap_model(ema_model)
         torch.save(unwrapped_ema.state_dict(), final_path)
-        print(f"Saved final EMA consistency model to {final_path}")
+        logger.debug(f"Saved final EMA consistency model to {final_path}")
     
     if use_wandb and accelerator.is_main_process:
         wandb.finish()
