@@ -1,10 +1,13 @@
 
 
 # Status
+I focus here - it's using wan2.1 architecture as base model to train seaweed.
+https://seaweed-apt.com/ - this work would yield a distilled teacher / student diffusion in 1 step.
 
-currently getting the stage 0 - seaweed to train....
-all this code derives from SD3.5 which has the multimodal diffusion transfomer MMDitX ( is this still relevant??)
-got wire up the SD3.5 weights to load
+
+https://github.com/johndpope/OmniHuman-1-hack/blob/main/SeaweedAPT/Wan2.1/wan.py
+
+I believe the seaweed derived from sd3.5 but that model is slightly off only 32 layers - not 36.
 
 ```shell
 pip install -r requirements.txt
