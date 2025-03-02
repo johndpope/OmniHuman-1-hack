@@ -15,16 +15,16 @@ from wan.utils.utils import str2bool
 
 def train_consistency_distillation(
     original_model,
-    config,
+    model_config,
     train_dataloader,
     checkpoint_dir,
     output_dir,
     device,
     accelerator,
     num_epochs=10,
-    learning_rate=1e-5,
-    cfg_scale=7.5,
-    save_interval=10,
+    learning_rate=5e-6,  # Aligned with paper's image training LR
+    cfg_scale=7.5,       # Paper uses constant CFG scale of 7.5
+    save_interval=350,   # Paper takes EMA checkpoint after 350 updates
     use_wandb=False,
     project_name="wan-consistency-distillation",
     run_name=None,
@@ -41,9 +41,9 @@ def train_consistency_distillation(
         device: Training device
         accelerator: Accelerator instance
         num_epochs: Number of training epochs
-        learning_rate: Learning rate for optimizer
-        cfg_scale: Classifier-free guidance scale
-        save_interval: Interval to save checkpoints (in steps)
+        learning_rate: Learning rate for optimizer (paper uses 5e-6 for images)
+        cfg_scale: Classifier-free guidance scale (paper uses 7.5)
+        save_interval: Interval to save checkpoints (paper uses 350 updates)
         use_wandb: Whether to use Weights & Biases for logging
         project_name: WandB project name
         run_name: WandB run name
@@ -66,15 +66,16 @@ def train_consistency_distillation(
                 "num_epochs": num_epochs,
                 "cfg_scale": cfg_scale,
                 "save_interval": save_interval,
+                "method": "consistency_distillation",
             }
         )
     
     # Initialize distilled model from scratch with same architecture
     distilled_model = WanModel.from_pretrained(checkpoint_dir)
     
-    # Create optimizer
-    optimizer = optim.AdamW(distilled_model.parameters(), lr=learning_rate)
-    
+    # Create optimizer (paper uses RMSProp with alpha=0.9, equivalent to Adam beta2=0.9)
+    optimizer = optim.RMSprop(distilled_model.parameters(), lr=learning_rate, alpha=0.9)
+
     # Set up accelerator
     distilled_model, optimizer, train_dataloader = accelerator.prepare(
         distilled_model, optimizer, train_dataloader
@@ -94,8 +95,17 @@ def train_consistency_distillation(
         tokenizer_path=f"{checkpoint_dir}/{config.t5_tokenizer}"
     )
     
-    # Negative prompt for classifier-free guidance
-    negative_prompt = config.sample_neg_prompt
+    # Negative prompt for CFG (paper uses fixed negative prompt)
+    negative_prompt = config.sample_neg_prompt or ""  # Empty string if not specified
+    # EMA setup (paper uses decay rate of 0.995)
+    ema_model = WanModel.from_pretrained(checkpoint_dir)
+    ema_model.eval()
+    ema_decay = 0.995
+    
+    def update_ema(target_model, source_model, decay):
+        with torch.no_grad():
+            for target_param, source_param in zip(target_model.parameters(), source_model.parameters()):
+                target_param.data.mul_(decay).add_(source_param.data, alpha=1 - decay)
     
     # Training loop
     step = 0
@@ -105,17 +115,17 @@ def train_consistency_distillation(
         print(f"Epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
-            # Process text prompts through text encoder
+            # Process text prompts
             context = text_encoder(text_prompts, device)
             context_null = text_encoder([negative_prompt] * len(text_prompts), device)
             
             # Generate random noise
             noise = torch.randn_like(samples)
             
-            # Use final timestep for one-step prediction
+            # Final timestep for one-step prediction (paper uses T)
             timestep = torch.ones(samples.shape[0], device=device) * config.num_train_timesteps
             
-            # Compute teacher prediction with classifier-free guidance
+            # Teacher prediction with CFG
             with torch.no_grad():
                 # Unconditional prediction
                 v_uncond = original_model(
@@ -133,10 +143,10 @@ def train_consistency_distillation(
                     seq_len=config.seq_len
                 )[0]
                 
-                # Apply classifier-free guidance
+                # CFG: v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
                 v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
             
-            # Compute student prediction
+            # Student prediction
             v_student = distilled_model(
                 [noise], 
                 t=timestep, 
@@ -144,13 +154,16 @@ def train_consistency_distillation(
                 seq_len=config.seq_len
             )[0]
             
-            # Compute MSE loss
+            # MSE loss (paper uses mean squared error for consistency distillation)
             loss = F.mse_loss(v_student, v_teacher)
             
-            # Update with accelerator
+            # Backpropagation
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
+            
+            # Update EMA
+            update_ema(ema_model, distilled_model, ema_decay)
             
             # Update stats
             total_loss += loss.item()
@@ -170,93 +183,80 @@ def train_consistency_distillation(
                 avg_loss = total_loss / (batch_idx + 1)
                 print(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {avg_loss:.6f}")
             
-            # Save checkpoint
+            # Save checkpoint with EMA weights
             if step % save_interval == 0 and accelerator.is_main_process:
                 checkpoint_path = f"{output_dir}/consistency_model_step_{step}.pt"
-                unwrapped_model = accelerator.unwrap_model(distilled_model)
-                torch.save(unwrapped_model.state_dict(), checkpoint_path)
-                print(f"Saved checkpoint to {checkpoint_path}")
+                unwrapped_ema = accelerator.unwrap_model(ema_model)
+                torch.save(unwrapped_ema.state_dict(), checkpoint_path)
+                print(f"Saved EMA checkpoint to {checkpoint_path}")
         
-        # Save epoch checkpoint
+        # Save epoch checkpoint with EMA weights
         if accelerator.is_main_process:
             checkpoint_path = f"{output_dir}/consistency_model_epoch_{epoch+1}.pt"
-            unwrapped_model = accelerator.unwrap_model(distilled_model)
-            torch.save(unwrapped_model.state_dict(), checkpoint_path)
-            print(f"Saved epoch checkpoint to {checkpoint_path}")
+            unwrapped_ema = accelerator.unwrap_model(ema_model)
+            torch.save(unwrapped_ema.state_dict(), checkpoint_path)
+            print(f"Saved EMA epoch checkpoint to {checkpoint_path}")
         
-        # Reset epoch stats
         total_loss = 0.0
     
-    # Save final model
+    # Save final EMA model
     if accelerator.is_main_process:
         final_path = f"{output_dir}/consistency_model_final.pt"
-        unwrapped_model = accelerator.unwrap_model(distilled_model)
-        torch.save(unwrapped_model.state_dict(), final_path)
-        print(f"Saved final consistency model to {final_path}")
+        unwrapped_ema = accelerator.unwrap_model(ema_model)
+        torch.save(unwrapped_ema.state_dict(), final_path)
+        print(f"Saved final EMA consistency model to {final_path}")
     
-    # Close wandb
     if use_wandb and accelerator.is_main_process:
         wandb.finish()
     
-    # Return the appropriate model
-    return accelerator.unwrap_model(distilled_model)
+    return accelerator.unwrap_model(ema_model)  # Return EMA model as per paper
 
 
 if __name__ == "__main__":
     import argparse
-    from wan.configs import t2v_14B,t2v_1_3B
-    from accelerate import Accelerator
+    from wan.configs import t2v_14B, t2v_1_3B
     
-    parser = argparse.ArgumentParser(description="Train consistency distillation for Wan")
+    parser = argparse.ArgumentParser(description="Train consistency distillation for Seaweed-APT")
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to Wan T2V model checkpoints")
-    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory for saving checkpoints")
-    parser.add_argument("--device_id", type=int, default=0, help="CUDA device ID (for original model)")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory for checkpoints")
+    parser.add_argument("--device_id", type=int, default=0, help="CUDA device ID")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--cfg_scale", type=float, default=7.5, help="Classifier-free guidance scale")
+    parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate (paper: 5e-6)")
+    parser.add_argument("--cfg_scale", type=float, default=7.5, help="CFG scale (paper: 7.5)")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--use_wandb", type=str2bool, default=False, help="Whether to use Weights & Biases")
-    parser.add_argument("--wandb_project", type=str, default="seaweed-apt", help="WandB project name")
+    parser.add_argument("--use_wandb", type=str2bool, default=False, help="Use Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="seaweed-apt-distillation", help="WandB project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
-    parser.add_argument("--config_file", type=str, default="./config.yaml", help="Path to OmegaConf config file")
-    parser.add_argument("--save_interval", type=int, default=10, help="Save checkpoint interval (steps)")
+    parser.add_argument("--config_file", type=str, default="./config.yaml", help="Path to config file")
+    parser.add_argument("--save_interval", type=int, default=350, help="Save interval (paper: 350 updates)")
     args = parser.parse_args()
     
-    # Load configuration from file if provided
+    # Load configuration
     if args.config_file and os.path.exists(args.config_file):
         config = OmegaConf.load(args.config_file)
-        # Merge with command line arguments (command line takes precedence)
         args_dict = vars(args)
         for key, value in config.items():
             if key not in args_dict or args_dict[key] is None:
                 args_dict[key] = value
         args = argparse.Namespace(**args_dict)
     
-    # Initialize accelerator
-    accelerator = Accelerator()
-    
-    # Set device - still needed for the original model and other components
+    # Initialize accelerator with BF16 mixed precision (paper uses BF16)
+    accelerator = Accelerator(mixed_precision="bf16")
     device = accelerator.device
     
-    # Initialize original Wan model - not wrapped by accelerator
+    # Initialize teacher model
+    config = t2v_1_3B #t2v_14B  # Use 14B model to align with paper's 8B parameter scale
     original_model = WanT2V(
-        config=t2v_1_3B,#t2v_14B
+        config=config,
         checkpoint_dir=args.checkpoint_dir,
         device_id=args.device_id,
         rank=0,
-    ).model
+    ).model.to(device)
     
-    # Move original model to accelerator device
-    original_model.to(device)
-    
-    # Create dummy dataset for this example
-    # In practice, you'd use your actual training dataset
-    from torch.utils.data import TensorDataset, DataLoader
-    
+    # Dummy dataset (replace with actual video dataset)
     dummy_data = torch.randn(100, 16, 1, 128, 128)  # [N, C, T, H, W]
     dummy_prompts = ["A beautiful landscape"] * 100
-    train_dataset = TensorDataset(dummy_data, torch.zeros(100))  # Second tensor is a placeholder
-    
+    train_dataset = torch.utils.data.TensorDataset(dummy_data, torch.zeros(100))
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size,
@@ -265,10 +265,10 @@ if __name__ == "__main__":
         pin_memory=True
     )
     
-    # Train consistency model
+    # Train
     distilled_model = train_consistency_distillation(
         original_model=original_model,
-        config=t2v_1_3B ,#t2v_14B
+        config=config,
         train_dataloader=train_dataloader,
         checkpoint_dir=args.checkpoint_dir,
         output_dir=args.output_dir,
