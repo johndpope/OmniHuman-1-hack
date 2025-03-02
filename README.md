@@ -1,64 +1,26 @@
-
+This paper builds off seaweed APT. so we have to implement / train this stage 0 first.
 
 # Status
 I focus here - it's using wan2.1 architecture as base model to train seaweed.
-https://seaweed-apt.com/ - this work would yield a distilled teacher / student diffusion in 1 step.
+https://github.com/johndpope/OmniHuman-1-hack/tree/main/SeaweedAPT/Wan2.1
+
+If successful - this work would yield a distilled teacher / student diffusion in 1 step.
+N.B. there's lots of these models coming soon - https://arxiv.org/html/2502.15681v1
+
+DRAFTED - stage 1 of 2 
+https://github.com/johndpope/OmniHuman-1-hack/blob/main/SeaweedAPT/Wan2.1/distilled_trainer.py
+
+DRAFTED - stage 2 of 2
+https://github.com/johndpope/OmniHuman-1-hack/blob/main/SeaweedAPT/Wan2.1/apt_trainer.py
 
 
-https://github.com/johndpope/OmniHuman-1-hack/blob/main/SeaweedAPT/Wan2.1/wan.py
-
-I believe the seaweed derived from sd3.5 but that model is slightly off only 32 layers - not 36.
-
-```shell
-pip install -r requirements.txt
-# you need to agree to ts and cs
-git clone https://huggingface.co/stabilityai/stable-diffusion-3.5-medium models
-python seaweed.py
-```
-
-
-UPDATE 1. 
-I throw hunyuan code at claude 3.7 and ask it to rearchictect things - 
-
-
-UPDATE 2. 
-It seems Wan2.1 is more promising match.
+I believe the canonical seaweed derived from sd3.5 but that model is slightly off only 32 layers - not 36.
 
 
 
-Understanding the Key Components
-First, let's look at the key components we need to adapt:
-
-Base Model Architecture: Seaweed APT uses a 36-layer MMDiT with 8B parameters, while Wan appears to be a transformer-based model with similar scale (using a 36-layer transformer with 8B parameters for T2V-14B variant).
-Adversarial Post-Training (APT) Process:
-
-Deterministic distillation to initialize the one-step generator
-Adversarial training with a discriminator derived from the original model
-Custom discriminator architecture with cross-attention blocks at specific layers
-Approximated R1 regularization for stability
 
 
-Training Protocol:
-
-Two-phase training: first on images, then on videos
-Specific batch sizes, learning rates, and update counts
-
-
-
-Adapting Seaweed's APT to Wan
-Here's my proposed approach for rearchitecting Seaweed using Wan:
-1. Base Model Preparation
-Wan seems to be an ideal candidate for adaptation because:
-
-It operates on a similar scale (8B parameters)
-It's a transformer-based model (using WanModel)
-It supports both text-to-video and image-to-video generation
-It has similar transformer block structures that can be modified for discriminator use
-
-Use the Wan T2V-14B variant as the base model, which has the full 36-layer transformer and 8B parameters matching Seaweed's scale.
-
-
-
+TODO -> 
 
 
 ### Functional Specification: OmniHuman Recreation
@@ -78,7 +40,7 @@ This spec outlines the components required to recreate OmniHuman, focusing on mo
 **Purpose:** Defines the foundational structure for video generation using a Diffusion Transformer (DiT) backbone.
 
 - **Subcomponent 1.1: Pretrained Base Model Adapter**
-  - **Functionality:** Adapts a pretrained video diffusion model (e.g., Seaweed with MMDiT) as the starting point.
+  - **Functionality:** Adapts a pretrained video diffusion model (e.g., Seaweed with MMDiT) as the starting point. ⛳️ <- we are here
   - **Inputs:** Pretrained weights from a general text-to-video model.
   - **Outputs:** Initialized DiT backbone for further conditioning and training.
   - **Requirements:** Supports integration of multiple modalities and retains text-to-video capabilities.
