@@ -25,8 +25,11 @@ https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P (image to video)
 DRAFTED - stage 1 of 2 (yet to complete a training pass)
 https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/distilled_trainer.py
 ```shell
+pip install "huggingface_hub[cli]"
+# huggingface-cli download Wan-AI/I2V-14B-480P --local-dir ./models/I2V-14B-480P
+huggingface-cli download https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B --local-dir ./models/Wan2.1-T2V-1.3B
 cd seaweed_apt
-python  distilled_trainer.py   --checkpoint_dir ./Wan2.1-T2V-14B
+python  distilled_trainer.py   --checkpoint_dir ../models/Wan2.1-T2V-1.3B
 ```
 
 DRAFTED - stage 2 of 2
