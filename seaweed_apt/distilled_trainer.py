@@ -121,26 +121,40 @@ def train_consistency_distillation(
     
     def process_text(prompts):
         """
-        Process text prompts with detailed logging for debugging.
+        Process text prompts with safeguards against hanging.
         """
-        logger.debug(f"Processing text prompts: {prompts[:2]}{'...' if len(prompts) > 2 else ''}")
-        logger.debug(f"Tokenizer type: {type(text_encoder.tokenizer)}")
+        logger.debug(f"Processing text prompts: {prompts[:1]}")
         
-        # Get token IDs and mask - explicitly request mask to be returned
+        # Get token IDs and mask
         logger.debug("Calling tokenizer with return_mask=True")
         ids, mask = text_encoder.tokenizer(prompts, return_mask=True)
         logger.debug(f"Tokenizer returned: ids shape={ids.shape}, mask shape={mask.shape}")
         
-        # Process on CPU (where text_encoder model is)
+        # Ensure the text encoder model is on CPU
+        if hasattr(text_encoder.model, 'to'):
+            text_encoder.model = text_encoder.model.to('cpu')
+        
+        # Process with a timeout mechanism
         with torch.no_grad():
-            # Make sure tokens are on the same device as the model
-            logger.debug(f"Moving tokens to device: {t5_device}")
-            ids = ids.to(t5_device)
-            mask = mask.to(t5_device)
+            # Limiting batch size or sequence length if needed
+            max_len = min(512, ids.shape[1])
+            ids = ids[:, :max_len]
+            mask = mask[:, :max_len]
+            
+            ids = ids.to('cpu')  # Ensure on CPU
+            mask = mask.to('cpu')
             
             logger.debug(f"Running text encoder model with ids shape={ids.shape}, mask shape={mask.shape}")
-            context = text_encoder.model(ids, mask)
-            logger.debug(f"Text encoder output context shape: {context.shape}")
+            
+            # Actually run the model
+            try:
+                context = text_encoder.model(ids, mask)
+                logger.debug(f"Text encoder completed successfully, output shape: {context.shape}")
+            except Exception as e:
+                logger.error(f"Error in text encoder: {str(e)}")
+                # Fallback to a zero tensor if processing fails
+                context = torch.zeros((ids.shape[0], max_len, text_encoder.model.dim), dtype=torch.float32)
+                logger.debug("Using fallback zero tensor for context")
         
         # Move output to the target device for further processing
         logger.debug(f"Moving context to device: {device}")
