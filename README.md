@@ -17,6 +17,7 @@ https://github.com/johndpope/OmniHuman-1-hack/blob/main/SeaweedAPT/Wan2.1/apt_tr
 I believe the canonical seaweed derived from sd3.5 but that model is slightly off only 32 layers - not 36.
 
 
+![OmniHuman-Seaweed Architecture](architecture-diagram.png)
 
 
 
