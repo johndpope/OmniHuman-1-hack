@@ -29,11 +29,11 @@ Velocity Field Shape = [B, C, T, H, W]
 Where:
 - B = Batch size
 - C = Number of channels in the latent space (16 for Wan's VAE)
-- T = Number of frames (e.g., 21 for 2 seconds at 24fps after VAE compression)
+- T = Number of frames (e.g., 21 for 2 seconds at 24fps after VAE compression with stride 4)
 - H = Height in latent space (e.g., 90 for 720p after VAE compression)
 - W = Width in latent space (e.g., 160 for 1280p after VAE compression)
 
-For a single 1280×720 video with 81 frames, the velocity field would be approximately:
+For a single 1280×720 video with 81 frames (2 seconds at 24fps + 1 frame), the velocity field after VAE compression would be approximately:
 ```
 [1, 16, 21, 90, 160] = 48,384,000 values
 ```
