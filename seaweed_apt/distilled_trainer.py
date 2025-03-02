@@ -102,10 +102,11 @@ def train_consistency_distillation(
     from wan.distributed.fsdp import shard_model
     from functools import partial
     shard_fn = partial(shard_model, device_id=0)
+    t5_device = torch.device('cpu')
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
         dtype=config.t5_dtype,
-        device=torch.device('cpu'), # T5EncoderModel is CPU-only unless you have a GPU with 24GB+ VRAM
+        device=t5_device, # T5EncoderModel is CPU-only unless you have a GPU with 24GB+ VRAM
         checkpoint_path=f"{checkpoint_dir}/{config.t5_checkpoint}",
         tokenizer_path=f"{checkpoint_dir}/{config.t5_tokenizer}",
         shard_fn=shard_fn if t5_fsdp else None,
@@ -123,6 +124,22 @@ def train_consistency_distillation(
             for target_param, source_param in zip(target_model.parameters(), source_model.parameters()):
                 target_param.data.mul_(decay).add_(source_param.data, alpha=1 - decay)
     
+
+    # Helper function to process text with proper device management
+    def process_text(prompts):
+        # Get token IDs and mask - explicitly request mask to be returned
+        ids, mask = text_encoder.tokenizer(prompts, return_mask=True)
+        
+        # Process on CPU (where text_encoder model is)
+        with torch.no_grad():
+            # Make sure tokens are on the same device as the model
+            ids = ids.to(t5_device)
+            mask = mask.to(t5_device)
+            context = text_encoder.model(ids, mask)
+            
+        # Move output to the target device for further processing
+        return context.to(device)
+    
     # Training loop
     step = 0
     total_loss = 0.0
@@ -132,10 +149,8 @@ def train_consistency_distillation(
         
         for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
             # Process text prompts
-            context = text_encoder(text_prompts, device)
-            # context_null = text_encoder([negative_prompt] * len(text_prompts), device)
-            context_null = get_context([negative_prompt] * len(text_prompts), text_encoder, device)
-            
+            context = process_text(text_prompts)
+            context_null = process_text([negative_prompt] * len(text_prompts))
             # Generate random noise
             noise = torch.randn_like(samples)
             

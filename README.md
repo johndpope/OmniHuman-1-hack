@@ -11,6 +11,10 @@
 
 I'm attempting to leverage Wan2.1 as the base model instead of SD3.5. If successful, this would yield a distilled teacher/student diffusion in 1 step.
 
+https://wandb.ai/snoozie/seaweed-apt-distillation
+
+
+
 **Note**: There are many similar models being developed - [https://arxiv.org/html/2502.15681v1](https://arxiv.org/html/2502.15681v1)
 
 ### Current Challenge
