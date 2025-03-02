@@ -210,53 +210,61 @@ class OmniHumanDataset(Dataset):
     def __del__(self):
         """Clean up MediaPipe resources."""
         self.mp_pose.close()
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import logging
+from pathlib import Path
+from tqdm import tqdm
+from typing import Dict, Tuple
+import wandb
+from omegaconf import DictConfig, OmegaConf
+from accelerate import Accelerator
 
-import wandb        
 class OmniHumanTrainer:
     """Handles multi-stage training process for OmniHuman with flow matching."""
     
     def __init__(
         self,
         model: nn.Module,
-        config: Dict,
-        device: str = "cuda",
+        config: DictConfig,
         output_dir: str = "outputs",
-        local_rank: int = 0
     ):
-        self.model = model.to(device)
+        self.model = model
         self.config = config
-        self.device = device
         self.output_dir = Path(output_dir)
-        self.local_rank = local_rank
         
-        self.setup_distributed()
+        # Initialize accelerator
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=config.get('gradient_accumulation_steps', 1),
+            mixed_precision=config.get('mixed_precision', 'no'),
+            log_with="wandb" if config.get('use_wandb', False) else None
+        )
+        
+        self.is_main_process = self.accelerator.is_main_process
         self.setup_optimizers()
         self.setup_logging()
         
-    def setup_distributed(self):
-        """Setup distributed training."""
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            self.model = DDP(
-                self.model,
-                device_ids=[self.local_rank],
-                output_device=self.local_rank
-            )
-            
+        # Prepare model, optimizer, and scheduler with accelerator
+        self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
+            self.model, self.optimizer, self.scheduler
+        )
+        
     def setup_optimizers(self):
         """Initialize optimizers and schedulers."""
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=self.config['learning_rate'],
+            lr=self.config.learning_rate,
             betas=(0.9, 0.999)
         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=self.config['total_steps']
+            T_max=self.config.total_steps
         )
         
     def setup_logging(self):
-        """Setup training logging with file output and optional W&B integration."""
-        if self.local_rank == 0:
+        """Setup training logging with file output and W&B integration."""
+        if self.is_main_process:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             # Setup file logging
             logging.basicConfig(
@@ -269,17 +277,19 @@ class OmniHumanTrainer:
             )
             
             # Initialize W&B if enabled
-            if self.use_wandb:
-                wandb.init(
-                    project="OmniHuman",
-                    config=self.config,
-                    name=f"run_stage_{self.local_rank}_{self.config.get('run_name', 'default')}",
-                    dir=str(self.output_dir),
-                    group="training" if self.local_rank == 0 else None,  # Group runs in distributed setup
-                    reinit=True  # Allow multiple runs in the same process
+            if self.config.get('use_wandb', False):
+                self.accelerator.init_trackers(
+                    project_name=self.config.get('wandb_project', "OmniHuman"),
+                    config=OmegaConf.to_container(self.config, resolve=True),
+                    init_kwargs={
+                        "wandb": {
+                            "name": self.config.get('run_name', 'default'),
+                            "dir": str(self.output_dir),
+                            "group": self.config.get('wandb_group', "training"),
+                        }
+                    }
                 )
-                wandb.watch(self.model, log="all", log_freq=100)  # Log gradients and parameters
-            
+    
     def flow_matching_loss(self, x: torch.Tensor, pred: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Compute flow matching loss (simplified version of ODE-based objective)."""
         # Flow matching aims to match the velocity field; here we use a simple MSE
@@ -291,7 +301,7 @@ class OmniHumanTrainer:
     def add_noise(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Add noise using a flow matching schedule."""
         batch_size = x.shape[0]
-        noise = torch.randn_like(x, device=self.device)
+        noise = torch.randn_like(x)
         # Linear interpolation for simplicity (could use cosine schedule)
         noisy_x = (1 - t.view(-1, 1, 1, 1, 1)) * x + t.view(-1, 1, 1, 1, 1) * noise
         return noisy_x, noise
@@ -303,7 +313,7 @@ class OmniHumanTrainer:
     ) -> torch.Tensor:
         """Execute single training step with flow matching."""
         batch_size = frames.shape[0]
-        t = torch.rand(batch_size, device=self.device)  # t in [0, 1]
+        t = torch.rand(batch_size, device=frames.device)  # t in [0, 1]
         
         # Add noise
         noisy_frames, noise = self.add_noise(frames, t)
@@ -330,12 +340,13 @@ class OmniHumanTrainer:
         total_loss = 0
         num_batches = 0
         
-        for batch in tqdm(dataloader, desc=f"Training Stage {stage}"):
-            self.optimizer.zero_grad()
-            
-            # Move data to device
-            frames = batch['frames'].to(self.device)
-            conditions = {k: v.to(self.device) for k, v in batch['conditions'].items()}
+        # Prepare dataloader with accelerator
+        dataloader = self.accelerator.prepare(dataloader)
+        
+        for batch in tqdm(dataloader, desc=f"Training Stage {stage}", disable=not self.is_main_process):
+            # Move data to device (handled by accelerator)
+            frames = batch['frames']
+            conditions = {k: v for k, v in batch['conditions'].items()}
             
             # Apply condition ratios
             active_conditions = {}
@@ -344,41 +355,55 @@ class OmniHumanTrainer:
                     if torch.rand(1).item() < ratio:
                         active_conditions[cond_type] = conditions[cond_type]
             
-            # Forward and backward pass
-            loss = self.training_step(frames, active_conditions)
-            loss.backward()
-            self.optimizer.step()
-            self.scheduler.step()
+            # Forward pass
+            with self.accelerator.accumulate(self.model):
+                loss = self.training_step(frames, active_conditions)
+                # Backward pass
+                self.accelerator.backward(loss)
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
             
             # Update metrics
-            total_loss += loss.item()
+            total_loss += self.accelerator.gather(loss).mean().item()
             num_batches += 1
             
             # Log progress
-            if self.local_rank == 0 and num_batches % self.config['log_interval'] == 0:
+            if self.is_main_process and num_batches % self.config.log_interval == 0:
                 avg_loss = total_loss / num_batches
                 logging.info(f"Stage {stage} | Batch {num_batches} | Loss: {avg_loss:.4f}")
                 
-        if self.local_rank == 0:
+                # Log to wandb
+                if self.config.get('use_wandb', False):
+                    self.accelerator.log({
+                        f"stage_{stage}/loss": avg_loss,
+                        f"stage_{stage}/lr": self.scheduler.get_last_lr()[0]
+                    }, step=num_batches)
+                
+        if self.is_main_process:
             self.save_checkpoint(stage, num_batches)
             
     def save_checkpoint(self, stage: int, step: int):
         """Save model checkpoint."""
-        if self.local_rank == 0:
+        if self.is_main_process:
+            # Get unwrapped model
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            
             checkpoint = {
-                'model_state_dict': self.model.state_dict(),
+                'model_state_dict': unwrapped_model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'stage': stage,
                 'step': step,
-                'config': self.config
+                'config': OmegaConf.to_container(self.config, resolve=True)
             }
-            torch.save(
+            
+            self.accelerator.save(
                 checkpoint,
                 self.output_dir / f'checkpoint_stage{stage}_step{step}.pt'
             )
             
-    def train(self, data_config: Dict) -> None:
+    def train(self, data_config: DictConfig, dataset_cls) -> None:
         """Execute complete training process with all stages per OmniHuman spec."""
         # Stage 1: Text and reference only (weakest conditions)
         stage1_ratios = {
@@ -387,17 +412,17 @@ class OmniHumanTrainer:
             'audio': 0.0,
             'pose': 0.0
         }
-        dataset = OmniHumanDataset(
-            data_config['data_dir'],
+        dataset = dataset_cls(
+            data_config.data_dir,
             stage1_ratios,
-            num_frames=self.config['num_frames'],
+            num_frames=self.config.num_frames,
             num_keypoints=33  # Match MediaPipe
         )
         dataloader = DataLoader(
             dataset,
-            batch_size=self.config['batch_size'],
+            batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=self.config['num_workers']
+            num_workers=self.config.num_workers
         )
         self.train_stage(1, dataloader, stage1_ratios)
         
@@ -408,17 +433,17 @@ class OmniHumanTrainer:
             'audio': 0.5,  # Halved from text/reference
             'pose': 0.0
         }
-        dataset = OmniHumanDataset(
-            data_config['data_dir'],
+        dataset = dataset_cls(
+            data_config.data_dir,
             stage2_ratios,
-            num_frames=self.config['num_frames'],
+            num_frames=self.config.num_frames,
             num_keypoints=33
         )
         dataloader = DataLoader(
             dataset,
-            batch_size=self.config['batch_size'],
+            batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=self.config['num_workers']
+            num_workers=self.config.num_workers
         )
         self.train_stage(2, dataloader, stage2_ratios)
         
@@ -427,36 +452,43 @@ class OmniHumanTrainer:
             'text': 1.0,    # Weakest condition, full ratio
             'reference': 1.0,
             'audio': 0.25,  # Stronger, reduced ratio
-            'pose': 0.13   # Strongest, lowest ratio
+            'pose': 0.13    # Strongest, lowest ratio
         }
-        dataset = OmniHumanDataset(
-            data_config['data_dir'],
+        dataset = dataset_cls(
+            data_config.data_dir,
             stage3_ratios,
-            num_frames=self.config['num_frames'],
+            num_frames=self.config.num_frames,
             num_keypoints=33
         )
         dataloader = DataLoader(
             dataset,
-            batch_size=self.config['batch_size'],
+            batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=self.config['num_workers']
+            num_workers=self.config.num_workers
         )
         self.train_stage(3, dataloader, stage3_ratios)
 
-# Example config
+# Example usage
 if __name__ == "__main__":
-    from omni_human import OmniHuman  # Assuming previous model code is in a file
-
-    config = {
+    from omegaconf import OmegaConf
+    
+    # Create config with OmegaConf
+    config = OmegaConf.create({
         'learning_rate': 1e-4,
         'total_steps': 100000,
         'batch_size': 4,
         'num_frames': 16,
         'num_workers': 4,
-        'log_interval': 100
-    }
-    data_config = {'data_dir': 'path/to/data'}
+        'log_interval': 100,
+        'use_wandb': True,
+        'wandb_project': 'OmniHuman',
+        'run_name': 'flow_matching_v1',
+        'mixed_precision': 'fp16',
+        'gradient_accumulation_steps': 2
+    })
+    
+    data_config = OmegaConf.create({'data_dir': 'path/to/data'})
     
     model = OmniHuman(num_frames=16)
     trainer = OmniHumanTrainer(model, config)
-    trainer.train(data_config)
+    trainer.train(data_config, OmniHumanDataset)
