@@ -13,6 +13,17 @@ from wan.modules.model import WanModel
 from wan.text2video import WanT2V
 from wan.utils.utils import str2bool
 
+
+def get_context(prompts, text_encoder, device):
+    # Process text prompts and ensure they're on the correct device
+    ids, mask = text_encoder.tokenizer(prompts)
+    ids = ids.to(device)
+    mask = mask.to(device)
+    # Get context
+    with torch.no_grad():
+        context = text_encoder.model(ids, mask)
+    return context
+
 def train_consistency_distillation(
     original_model,
     config,
@@ -28,6 +39,7 @@ def train_consistency_distillation(
     use_wandb=False,
     project_name="wan-consistency-distillation",
     run_name=None,
+    t5_fsdp=False,
 ):
     """
     Train a consistency-distilled model from the original Wan model.
@@ -87,12 +99,16 @@ def train_consistency_distillation(
     
     # Create T5 text encoder for processing text prompts
     from wan.modules.t5 import T5EncoderModel
+    from wan.distributed.fsdp import shard_model
+    from functools import partial
+    shard_fn = partial(shard_model, device_id=0)
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
         dtype=config.t5_dtype,
-        device=device,
+        device=torch.device('cpu'), # T5EncoderModel is CPU-only unless you have a GPU with 24GB+ VRAM
         checkpoint_path=f"{checkpoint_dir}/{config.t5_checkpoint}",
-        tokenizer_path=f"{checkpoint_dir}/{config.t5_tokenizer}"
+        tokenizer_path=f"{checkpoint_dir}/{config.t5_tokenizer}",
+        shard_fn=shard_fn if t5_fsdp else None,
     )
     
     # Negative prompt for CFG (paper uses fixed negative prompt)
@@ -117,7 +133,8 @@ def train_consistency_distillation(
         for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
             # Process text prompts
             context = text_encoder(text_prompts, device)
-            context_null = text_encoder([negative_prompt] * len(text_prompts), device)
+            # context_null = text_encoder([negative_prompt] * len(text_prompts), device)
+            context_null = get_context([negative_prompt] * len(text_prompts), text_encoder, device)
             
             # Generate random noise
             noise = torch.randn_like(samples)
@@ -224,11 +241,36 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate (paper: 5e-6)")
     parser.add_argument("--cfg_scale", type=float, default=7.5, help="CFG scale (paper: 7.5)")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-    parser.add_argument("--use_wandb", type=str2bool, default=False, help="Use Weights & Biases")
+    parser.add_argument("--use_wandb", type=str2bool, default=True, help="Use Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="seaweed-apt-distillation", help="WandB project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
     parser.add_argument("--config_file", type=str, default="./config.yaml", help="Path to config file")
     parser.add_argument("--save_interval", type=int, default=350, help="Save interval (paper: 350 updates)")
+    parser.add_argument(
+    "--t5_cpu",
+    action="store_true",
+    default=False,
+    help="Whether to place T5 model on CPU.")
+    parser.add_argument(
+    "--dit_fsdp",
+    action="store_true",
+    default=False,
+    help="Whether to use FSDP for DiT.")
+    parser.add_argument(
+        "--ulysses_size",
+        type=int,
+        default=1,
+        help="The size of the ulysses parallelism in DiT.")
+    parser.add_argument(
+        "--ring_size",
+        type=int,
+        default=1,
+        help="The size of the ring attention parallelism in DiT.")
+    parser.add_argument(
+        "--t5_fsdp",
+        action="store_true",
+        default=False,
+        help="Whether to use FSDP for T5.")
     args = parser.parse_args()
     
     # Load configuration
@@ -251,12 +293,39 @@ if __name__ == "__main__":
         checkpoint_dir=args.checkpoint_dir,
         device_id=args.device_id,
         rank=0,
+        t5_fsdp=args.t5_fsdp,
+        dit_fsdp=args.dit_fsdp,
+        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+        t5_cpu=args.t5_cpu
     ).model.to(device)
     
-    # Dummy dataset (replace with actual video dataset)
+
+    class TextVideoDataset(torch.utils.data.Dataset):
+        def __init__(self, video_tensors, text_prompts):
+            """
+            Custom dataset for text-to-video training
+            
+            Args:
+                video_tensors: Tensor of video data with shape [N, C, T, H, W]
+                text_prompts: List of text prompts (strings)
+            """
+            self.video_tensors = video_tensors
+            self.text_prompts = text_prompts
+            assert len(video_tensors) == len(text_prompts), "Number of videos and prompts must match"
+            
+        def __len__(self):
+            return len(self.video_tensors)
+        
+        def __getitem__(self, idx):
+            return self.video_tensors[idx], self.text_prompts[idx]
+
+    # Create proper dataset with videos and text prompts
     dummy_data = torch.randn(100, 16, 1, 128, 128)  # [N, C, T, H, W]
     dummy_prompts = ["A beautiful landscape"] * 100
-    train_dataset = torch.utils.data.TensorDataset(dummy_data, torch.zeros(100))
+    train_dataset = TextVideoDataset(dummy_data, dummy_prompts)
+
+
+
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size,

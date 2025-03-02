@@ -38,6 +38,11 @@ python distilled_trainer.py --checkpoint_dir ../models/Wan2.1-T2V-1.3B
 - Datasets / dataloaders - in progress
 
 
+
+### Troubleshooting OOM - out of memory
+https://github.com/johndpope/MegaPortrait-hack/issues/61
+
+
 ### Functional Specification: OmniHuman Recreation
 
 https://github.com/johndpope/OmniHuman-1-hack/blob/main/Omnihuman
