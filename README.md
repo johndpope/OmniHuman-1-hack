@@ -24,7 +24,7 @@ This paper builds off seaweed APT. so we have to implement / train this stage 0 
 
 ### Functional Specification: OmniHuman Recreation
 
-
+https://github.com/johndpope/OmniHuman-1-hack/blob/main/Omnihuman
 
 #### Overview
 The OmniHuman system is a Diffusion Transformer (DiT)-based framework designed for scalable, end-to-end human video generation conditioned on multiple modalities (text, audio, pose, and reference images). It aims to produce highly realistic human animations supporting various input types (e.g., portrait, half-body, full-body), aspect ratios, and styles, while excelling in gesture generation and object interaction. The system leverages a novel "omni-conditions" training strategy to maximize data utilization and scalability.
