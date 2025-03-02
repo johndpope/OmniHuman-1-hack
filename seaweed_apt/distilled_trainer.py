@@ -223,7 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate (paper: 5e-6)")
     parser.add_argument("--cfg_scale", type=float, default=7.5, help="CFG scale (paper: 7.5)")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--use_wandb", type=str2bool, default=False, help="Use Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="seaweed-apt-distillation", help="WandB project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
@@ -261,7 +261,7 @@ if __name__ == "__main__":
         train_dataset, 
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=1,
         pin_memory=True
     )
     
