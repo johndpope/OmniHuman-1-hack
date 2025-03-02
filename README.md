@@ -14,6 +14,47 @@ python seaweed.py
 ```
 
 
+UPDATE 1. 
+I throw hunyuan code at claude 3.7 and ask it to rearchictect things - 
+
+
+UPDATE 2. 
+It seems Wan2.1 is more promising match.
+
+
+
+Understanding the Key Components
+First, let's look at the key components we need to adapt:
+
+Base Model Architecture: Seaweed APT uses a 36-layer MMDiT with 8B parameters, while Wan appears to be a transformer-based model with similar scale (using a 36-layer transformer with 8B parameters for T2V-14B variant).
+Adversarial Post-Training (APT) Process:
+
+Deterministic distillation to initialize the one-step generator
+Adversarial training with a discriminator derived from the original model
+Custom discriminator architecture with cross-attention blocks at specific layers
+Approximated R1 regularization for stability
+
+
+Training Protocol:
+
+Two-phase training: first on images, then on videos
+Specific batch sizes, learning rates, and update counts
+
+
+
+Adapting Seaweed's APT to Wan
+Here's my proposed approach for rearchitecting Seaweed using Wan:
+1. Base Model Preparation
+Wan seems to be an ideal candidate for adaptation because:
+
+It operates on a similar scale (8B parameters)
+It's a transformer-based model (using WanModel)
+It supports both text-to-video and image-to-video generation
+It has similar transformer block structures that can be modified for discriminator use
+
+Use the Wan T2V-14B variant as the base model, which has the full 36-layer transformer and 8B parameters matching Seaweed's scale.
+
+
 
 
 
