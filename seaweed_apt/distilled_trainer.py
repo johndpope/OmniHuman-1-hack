@@ -449,6 +449,9 @@ if __name__ == "__main__":
     
     # Initialize teacher model
     config = t2v_1_3B #t2v_14B  # Use 14B model to align with paper's 8B parameter scale
+    if not hasattr(config, 'seq_len'):
+        config.seq_len = 512  # Match the text encoder's sequence length
+        
     original_model = WanT2V(
         config=config,
         checkpoint_dir=args.checkpoint_dir,
@@ -481,8 +484,9 @@ if __name__ == "__main__":
             return self.video_tensors[idx], self.text_prompts[idx]
 
     # Create proper dataset with videos and text prompts
-    dummy_data = torch.randn(100, 16, 1, 128, 128)  # [N, C, T, H, W]
-    dummy_prompts = ["A beautiful landscape"] * 100
+    N = 10
+    dummy_data = torch.randn(N, 16, 1, 128, 128)  # [N, C, T, H, W]
+    dummy_prompts = ["A beautiful landscape"] * N
     train_dataset = TextVideoDataset(dummy_data, dummy_prompts)
 
 
