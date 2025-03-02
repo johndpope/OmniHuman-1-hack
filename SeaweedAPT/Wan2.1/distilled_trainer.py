@@ -218,7 +218,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", type=str2bool, default=False, help="Whether to use Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="wan-consistency-distillation", help="WandB project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
-    parser.add_argument("--config_file", type=str, default=None, help="Path to OmegaConf config file")
+    parser.add_argument("--config_file", type=str, default="./config.yaml", help="Path to OmegaConf config file")
     parser.add_argument("--save_interval", type=int, default=10, help="Save checkpoint interval (steps)")
     args = parser.parse_args()
     

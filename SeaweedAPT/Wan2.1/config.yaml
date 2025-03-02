@@ -1,0 +1,54 @@
+# f-Distillation Training Configuration
+
+# Training parameters
+num_epochs: 10
+learning_rate: 1.0e-5
+batch_size: 8
+save_interval: 20
+
+# Model parameters
+cfg_scale: 7.5  # Classifier-free guidance scale
+
+# f-Divergence parameters
+f_divergence: "jensen-shannon"  # Options: reverse-kl, forward-kl, jensen-shannon, squared-hellinger, softened-rkl
+use_discriminator: true
+discriminator_lr: 1.0e-5
+alpha: 0.1  # Weight for GAN loss
+beta: 0.9   # Weight for f-divergence loss
+
+# Logging parameters
+use_wandb: false
+wandb_project: "wan-consistency-distillation"
+wandb_run_name: "f-distill-js-run1"
+
+# Optimization tuning
+use_gradient_clipping: true
+max_grad_norm: 1.0
+warmup_steps: 1000
+scheduler_type: "cosine"  # Options: linear, cosine, constant
+
+# Advanced settings
+noise_scheduler:
+  min_snr_gamma: 5.0
+  timestep_spacing: "leading"  # Options: leading, trailing, uniform
+
+# Distillation specific
+consistency_training:
+  # Lower for more stable training, higher for potentially better quality
+  ema_rate: 0.999
+  # Apply consistency distillation at these noise levels
+  sigma_min: 0.002
+  sigma_max: 80.0
+  # Number of diffusion steps to emulate in teacher
+  teacher_steps: 50
+  
+# Data handling
+data_processing:
+  image_size: 256
+  center_crop: true
+  random_flip: true
+  
+# System parameters
+cache_latents: true
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+gradient_accumulation_steps: 1
