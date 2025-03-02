@@ -98,6 +98,7 @@ def train_consistency_distillation(
     distilled_model.train()
     
     # Create T5 text encoder for processing text prompts
+    print(f"Initializing text encoder on {t5_device}...")
     from wan.modules.t5 import T5EncoderModel
     from wan.distributed.fsdp import shard_model
     from functools import partial
@@ -111,10 +112,10 @@ def train_consistency_distillation(
         tokenizer_path=f"{checkpoint_dir}/{config.t5_tokenizer}",
         shard_fn=shard_fn if t5_fsdp else None,
     )
-    
     # Negative prompt for CFG (paper uses fixed negative prompt)
     negative_prompt = config.sample_neg_prompt or ""  # Empty string if not specified
     # EMA setup (paper uses decay rate of 0.995)
+    print("Setting up EMA model...")
     ema_model = WanModel.from_pretrained(checkpoint_dir)
     ema_model.eval()
     ema_decay = 0.995
@@ -144,10 +145,13 @@ def train_consistency_distillation(
     step = 0
     total_loss = 0.0
     
+    print("Starting training loop...")
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
+            print(f"Processing text prompts for batch {batch_idx}")
+
             # Process text prompts
             context = process_text(text_prompts)
             context_null = process_text([negative_prompt] * len(text_prompts))

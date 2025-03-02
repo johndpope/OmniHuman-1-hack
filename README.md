@@ -32,7 +32,7 @@ pip install "huggingface_hub[cli]"
 # huggingface-cli download Wan-AI/I2V-14B-480P --local-dir ./models/I2V-14B-480P
 huggingface-cli download https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B --local-dir ./models/Wan2.1-T2V-1.3B
 cd seaweed_apt
-python distilled_trainer.py --checkpoint_dir ../models/Wan2.1-T2V-1.3B
+./train.sh
 ```
 
 **DRAFTED - Stage 2 of 2**
