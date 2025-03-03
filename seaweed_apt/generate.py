@@ -28,7 +28,7 @@ EXAMPLE_PROMPT = {
 
 
 def generate_batch(config, num_samples=100):
-    _init_logging()
+
     rank = 0  # Single process for simplicity
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
