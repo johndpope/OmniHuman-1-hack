@@ -313,7 +313,7 @@ def train_consistency_distillation(
         wandb.finish()
     
     return accelerator.unwrap_model(ema_model)  # Return EMA model as per paper
-    
+
 
 
 if __name__ == "__main__":
@@ -413,15 +413,15 @@ if __name__ == "__main__":
     data_file = "dummy_data.pt"
     prompts_file = "dummy_prompts.pt"
     if not (os.path.exists(data_file) and os.path.exists(prompts_file)):
-        logging.error(f"Required files {data_file} and/or {prompts_file} not found.")
-        logging.info("Please run generate.py to create the dummy data first.")
+        logger.error(f"Required files {data_file} and/or {prompts_file} not found.")
+        logger.info("Please run generate.py to create the dummy data first.")
         sys.exit(1)  # Exit with error code 1
 
     # Load generated data
     dummy_data = torch.load(data_file)  # [100, 16, 1, 128, 128]
     dummy_prompts = torch.load(prompts_file)  # List of 100 prompts
-    logging.info(f"Loaded dummy_data with shape: {dummy_data.shape}")
-    logging.info(f"Loaded {len(dummy_prompts)} prompts")
+    logger.info(f"Loaded dummy_data with shape: {dummy_data.shape}")
+    logger.info(f"Loaded {len(dummy_prompts)} prompts")
 
 
 

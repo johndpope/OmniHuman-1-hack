@@ -1,9 +1,10 @@
 # Copyright 2024-2025 @johndpope All rights reserved.
-import logging
+
 import os
 import sys
 import warnings
 from datetime import datetime
+from logger import logger
 
 warnings.filterwarnings('ignore')
 
@@ -24,12 +25,7 @@ EXAMPLE_PROMPT = {
     },
 }
 
-def _init_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s: %(message)s",
-        handlers=[logging.StreamHandler(stream=sys.stdout)]
-    )
+
 
 def generate_batch(config, num_samples=100):
     _init_logging()
@@ -42,7 +38,7 @@ def generate_batch(config, num_samples=100):
     ckpt_dir = config.ckpt_dir if hasattr(config, 'ckpt_dir') else "/path/to/checkpoints"  # Replace with your path
 
     # Initialize WanT2V pipeline
-    logging.info("Creating WanT2V pipeline.")
+    logger.info("Creating WanT2V pipeline.")
     wan_t2v = wan.WanT2V(
         config=cfg,
         checkpoint_dir=ckpt_dir,
@@ -63,7 +59,7 @@ def generate_batch(config, num_samples=100):
         seed = base_seed + i
         prompt = f"{base_prompt} variation {i}" if i > 0 else base_prompt
         
-        logging.info(f"Generating sample {i+1}/{num_samples} with prompt: {prompt}")
+        logger.info(f"Generating sample {i+1}/{num_samples} with prompt: {prompt}")
         video = wan_t2v.generate(
             prompt,
             size=SIZE_CONFIGS["128*128"],  # Match your dummy data size
@@ -92,4 +88,4 @@ if __name__ == "__main__":
     # Save for training
     torch.save(dummy_data, "dummy_data.pt")
     torch.save(dummy_prompts, "dummy_prompts.pt")
-    logging.info(f"Generated dummy_data shape: {dummy_data.shape}")
+    logger.info(f"Generated dummy_data shape: {dummy_data.shape}")
