@@ -156,7 +156,7 @@ def train_consistency_distillation(
         torch.cuda.empty_cache()
         
         logger.debug(f"Final context shape: {context.shape}")
-        return context
+        return context.to(torch.float32)
 
     # Initialize stats
     total_loss = 0.0
@@ -195,10 +195,17 @@ def train_consistency_distillation(
             noise = noise.squeeze(0)  # Shape: [16, 1, 128, 128]
             logger.debug(f"Adjusted noise shape: {noise.shape}")
             
-            # Final timestep for one-step prediction
-            logger.debug("Creating timestep tensor")
+
+            # Compute seq_len dynamically based on samples
+            patch_size = original_model.patch_size  # (1, 2, 2)
+            seq_len = (samples.shape[2] // patch_size[0]) * \
+                      (samples.shape[3] // patch_size[1]) * \
+                      (samples.shape[4] // patch_size[2])  # e.g., 1560 for [16, 1, 60, 104]
+            logger.debug(f"Computed seq_len for batch: {seq_len}")
+            
             timestep = torch.ones(samples.shape[0], device=device) * config.num_train_timesteps
             logger.debug(f"Timestep shape: {timestep.shape}, value: {timestep[0].item()}")
+            
             
             # Move original_model to GPU for teacher prediction
             logger.debug(f"Moving original_model to {device}")
@@ -209,21 +216,11 @@ def train_consistency_distillation(
             logger.debug("Starting teacher model prediction")
             with torch.no_grad():
                 logger.debug("Running unconditional prediction with original model")
-                v_uncond = original_model(
-                    [noise],
-                    t=timestep,
-                    context=context_null,
-                    seq_len=config.seq_len
-                )[0]
+                v_uncond = original_model([noise], t=timestep, context=context_null, seq_len=seq_len)[0] 
                 logger.debug(f"Unconditional prediction shape: {v_uncond.shape}")
                 
                 logger.debug("Running conditional prediction with original model")
-                v_cond = original_model(
-                    [noise],
-                    t=timestep,
-                    context=context,
-                    seq_len=config.seq_len
-                )[0]
+                v_cond = original_model([noise], t=timestep, context=context, seq_len=seq_len)[0]       
                 logger.debug(f"Conditional prediction shape: {v_cond.shape}")
                 
                 logger.debug(f"Applying classifier-free guidance with scale: {cfg_scale}")
@@ -237,12 +234,7 @@ def train_consistency_distillation(
             
             # Student prediction
             logger.debug("Running student model prediction")
-            v_student = distilled_model(
-                [noise],
-                t=timestep,
-                context=context,
-                seq_len=config.seq_len
-            )[0]
+            v_student = distilled_model([noise], t=timestep, context=context, seq_len=seq_len)[0]
             logger.debug(f"Student prediction shape: {v_student.shape}")
             
             # MSE loss calculation
