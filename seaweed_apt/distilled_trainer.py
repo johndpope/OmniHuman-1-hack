@@ -422,7 +422,7 @@ if __name__ == "__main__":
     dummy_prompts = torch.load(prompts_file)  # List of 100 prompts
     logger.info(f"Loaded dummy_data with shape: {dummy_data.shape}")
     logger.info(f"Loaded {len(dummy_prompts)} prompts")
-
+    train_dataset = TextVideoDataset(dummy_data, dummy_prompts)
 
 
     train_dataloader = DataLoader(

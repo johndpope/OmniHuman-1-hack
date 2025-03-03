@@ -3,3 +3,5 @@
 project.log
 models/
 seaweed_apt/wandb/*
+seaweed_apt/dummy_data.pt
+seaweed_apt/dummy_prompts.pt
