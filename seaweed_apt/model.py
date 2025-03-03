@@ -12,7 +12,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from wan.modules.model import WanModel
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae import WanVAE
-
+from logger import logger
 
 
 class WanCrossAttentionDiscriminatorBlock(nn.Module):
@@ -131,6 +131,8 @@ class WanAPTDiscriminator(nn.Module):
         # Process input through backbone up to layer 16
         features = []
         layer_outputs = {}
+
+
         
         # We need to hook into the forward computation of the backbone
         # to extract intermediate layer outputs
@@ -146,10 +148,14 @@ class WanAPTDiscriminator(nn.Module):
         hooks.append(self.backbone.blocks[35].register_forward_hook(
             lambda m, i, o: extract_features(m, i, o, 36)))
         
-        # Forward pass through backbone
-        with torch.no_grad():
-            self.backbone(x, t, context, seq_len)
+        # Apply timestep shift as described in the paper 3.3. Discriminator
+        s = 1.0 if x.shape[2] == 1 else 12.0  # s=1 for images, s=12 for videos
+        t_shifted = s * t / (1.0 + (s - 1.0) * t)
         
+        # Use the shifted timestep in the backbone processing
+        with torch.no_grad():
+            self.backbone(x, t_shifted, context, seq_len)
+
         # Remove hooks
         for hook in hooks:
             hook.remove()
@@ -194,7 +200,8 @@ class WanAPTGenerator(nn.Module):
             x: Generated latents
         """
         # Always use final timestep for one-step generation
-        t = torch.ones(z.shape[0], device=z.device) * self.final_timestep
+        batch_size = z.shape[0]
+        t = torch.ones(batch_size,  device=z.device) * self.final_timestep
         
         # Predict velocity field
         v = self.model(z, t, context, seq_len)
