@@ -162,6 +162,11 @@ def train_consistency_distillation(
         logger.debug(f"Final context shape: {result.shape}")
         return result
 
+    # Ensure models start on CPU to free VRAM initially
+    text_encoder.model = text_encoder.model.to('cpu')
+    original_model = original_model.to('cpu')
+    logger.debug("Initialized models on CPU")
+
     # Enhanced training loop with detailed logging
     for epoch in range(num_epochs):
         logger.debug(f"Starting epoch {epoch+1}/{num_epochs}")
@@ -169,57 +174,59 @@ def train_consistency_distillation(
         for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
             logger.debug(f"Batch {batch_idx}: samples shape={samples.shape}, text_prompts length={len(text_prompts)}")
             logger.debug(f"Sample text prompt example: {text_prompts[0][:50]}...")
-            
+
             # Move samples to device
             logger.debug(f"Moving samples to device: {device}")
             samples = samples.to(device)
-            
-            # Process text prompts
+
+            # Process text prompts (unchanged)
             logger.debug("Processing positive text prompts")
             context = process_text(text_prompts)
             logger.debug(f"Positive context shape: {context[0].shape if isinstance(context, list) else context.shape}")
-            
             logger.debug("Processing negative text prompts")
             context_null = process_text([negative_prompt] * len(text_prompts))
             logger.debug(f"Negative context shape: {context_null[0].shape if isinstance(context_null, list) else context_null.shape}")
-            
+
             # Generate random noise
             logger.debug("Generating random noise")
-            noise = torch.randn_like(samples)
+            noise = torch.randn_like(samples)  # Shape: [1, 16, 1, 128, 128]
             logger.debug(f"Noise shape: {noise.shape}")
-            
+
+            # Adjust noise to 4D
+            noise = noise.squeeze(0)  # Shape: [16, 1, 128, 128]
+            logger.debug(f"Adjusted noise shape: {noise.shape}")
+
             # Final timestep for one-step prediction
             logger.debug("Creating timestep tensor")
             timestep = torch.ones(samples.shape[0], device=device) * config.num_train_timesteps
             logger.debug(f"Timestep shape: {timestep.shape}, value: {timestep[0].item()}")
-            
-            # Teacher prediction with CFG
+
+            # Teacher prediction
             logger.debug("Starting teacher model prediction")
             with torch.no_grad():
                 # Unconditional prediction
                 logger.debug("Running unconditional prediction with original model")
                 v_uncond = original_model(
-                    [noise], 
-                    t=timestep, 
-                    context=context_null, 
+                    [noise],  # List of 4D tensor
+                    t=timestep,
+                    context=context_null,
                     seq_len=config.seq_len
                 )[0]
                 logger.debug(f"Unconditional prediction shape: {v_uncond.shape}")
-                
-                # Conditional prediction
-                logger.debug("Running conditional prediction with original model")
+
                 v_cond = original_model(
-                    [noise], 
-                    t=timestep, 
-                    context=context, 
+                    [noise],
+                    t=timestep,
+                    context=context,
                     seq_len=config.seq_len
                 )[0]
                 logger.debug(f"Conditional prediction shape: {v_cond.shape}")
-                
                 # CFG: v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
                 logger.debug(f"Applying classifier-free guidance with scale: {cfg_scale}")
                 v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
                 logger.debug(f"Teacher prediction shape: {v_teacher.shape}")
+                
+
             
             # Student prediction
             logger.debug("Running student model prediction")
