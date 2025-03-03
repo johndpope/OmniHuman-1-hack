@@ -140,11 +140,18 @@ RANDOM_PROMPTS = [
 def generate_batch(config, num_samples=100):
     rank = 0  # Single process for simplicity
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.debug(f"Using device: {device}")
+
+    # Ensure config has text_len
+    if not hasattr(config, 'text_len'):
+        config.text_len = 512  # For text encoder
+        logger.warning("Config missing 'text_len'. Defaulting to 512.")
 
     # Extract task and model config
     task = config.task if hasattr(config, 'task') else "t2v-14B"
     cfg = WAN_CONFIGS[task]
-    ckpt_dir = config.ckpt_dir if hasattr(config, 'ckpt_dir') else "/path/to/checkpoints"  # Replace with your path
+    ckpt_dir = config.ckpt_dir if hasattr(config, 'ckpt_dir') else "/path/to/checkpoints"
+    logger.debug(f"Task: {task}, Checkpoint dir: {ckpt_dir}")
 
     # Initialize WanT2V pipeline
     logger.info("Creating WanT2V pipeline.")
@@ -159,39 +166,115 @@ def generate_batch(config, num_samples=100):
         t5_cpu=False,
     )
 
+    # Move text encoder and model to GPU
+    logger.debug("Moving text encoder to GPU")
+    wan_t2v.text_encoder.model.to(device)
+    logger.debug("Moving WanModel to GPU")
+    wan_t2v.model.to(device)
+
     # Generate multiple samples with random prompts
     dummy_data_list = []
-    dummy_prompts = RANDOM_PROMPTS[:num_samples]  # Use first num_samples prompts
+    dummy_prompts = RANDOM_PROMPTS[:num_samples]
     base_seed = random.randint(0, sys.maxsize) if not hasattr(config, 'base_seed') else config.base_seed
-    
+    logger.debug(f"Base seed: {base_seed}, Num samples: {num_samples}")
+
+    # Precompute target latent shape and seq_len
+    size = SIZE_CONFIGS["480*832"]  # (480, 832)
+    target_shape = (
+        wan_t2v.vae.model.z_dim,  # 16 channels
+        1,  # Single frame
+        size[0] // wan_t2v.vae_stride[1],  # 480 / 8 = 60
+        size[1] // wan_t2v.vae_stride[2],  # 832 / 8 = 104
+    )
+    patch_size = wan_t2v.model.patch_size  # (1, 2, 2)
+    seq_len = (target_shape[1] // patch_size[0]) * \
+              (target_shape[2] // patch_size[1]) * \
+              (target_shape[3] // patch_size[2])  # 1 * 30 * 52 = 1560
+    logger.info(f"Computed seq_len: {seq_len}")
+    logger.debug(f"Target latent shape: {target_shape}")
+    logger.debug(f"Patch size: {patch_size}")
+
     for i, prompt in enumerate(dummy_prompts):
         seed = base_seed + i
         
         logger.info(f"Generating sample {i+1}/{num_samples} with prompt: {prompt}")
-        video = wan_t2v.generate(
-            prompt,
-            size=SIZE_CONFIGS["480*832"],  # Grok thinks 128*128 will work.... Match your dummy data size [N, 16, 1, 128, 128]
-            frame_num=1,  # Single frame to match T=1
-            shift=5.0,
-            sample_solver='unipc',
-            sampling_steps=50,
-            guide_scale=config.cfg_scale if hasattr(config, 'cfg_scale') else 7.5,
-            seed=seed,
-            offload_model=True
-        )
-        # video shape: [1, 16, 1, 128, 128] (B, C, T, H, W)
-        dummy_data_list.append(video.squeeze(0))  # [16, 1, 128, 128]
+        with torch.no_grad():
+            # Generate noise in latent space
+            seed_g = torch.Generator(device=device)
+            seed_g.manual_seed(seed)
+            noise = torch.randn(
+                1, *target_shape,  # [1, 16, 1, 60, 104]
+                dtype=torch.float32,
+                device=device,
+                generator=seed_g
+            )
+            logger.debug(f"Noise shape: {noise.shape}, dtype: {noise.dtype}, device: {noise.device}")
+
+            # Text encoding
+            logger.debug("Encoding prompt")
+            context = wan_t2v.text_encoder([prompt], device)
+            logger.debug(f"Context shape: {context[0].shape}, dtype: {context[0].dtype}, device: {context[0].device}")
+            logger.debug("Encoding negative prompt")
+            context_null = wan_t2v.text_encoder([config.sample_neg_prompt], device)
+            logger.debug(f"Context_null shape: {context_null[0].shape}, dtype: {context_null[0].dtype}, device: {context_null[0].device}")
+
+            # Convert context to float32 to match WanModel
+            context = [c.to(torch.float32) for c in context]
+            context_null = [c.to(torch.float32) for c in context_null]
+            logger.debug(f"Converted context to dtype: {context[0].dtype}")
+            logger.debug(f"Converted context_null to dtype: {context_null[0].dtype}")
+
+            # Diffusion sampling (single step for demo)
+            timestep = torch.tensor([wan_t2v.num_train_timesteps - 1], device=device, dtype=torch.float32)
+            logger.debug(f"Timestep shape: {timestep.shape}, value: {timestep.item()}, dtype: {timestep.dtype}, device: {timestep.device}")
+            noise_list = [noise[0]]  # [16, 1, 60, 104]
+            logger.debug(f"Noise list shape: {noise_list[0].shape}, dtype: {noise_list[0].dtype}, device: {noise_list[0].device}")
+
+            logger.debug("Running conditioned prediction")
+            noise_pred_cond = wan_t2v.model(noise_list, t=timestep, context=context, seq_len=seq_len)[0]
+            logger.debug(f"Noise_pred_cond shape: {noise_pred_cond.shape}, dtype: {noise_pred_cond.dtype}, device: {noise_pred_cond.device}")
+
+            logger.debug("Running unconditioned prediction")
+            noise_pred_uncond = wan_t2v.model(noise_list, t=timestep, context=context_null, seq_len=seq_len)[0]
+            logger.debug(f"Noise_pred_uncond shape: {noise_pred_uncond.shape}, dtype: {noise_pred_uncond.dtype}, device: {noise_pred_uncond.device}")
+
+            latent = noise_pred_uncond + 7.5 * (noise_pred_cond - noise_pred_uncond)  # CFG scale 7.5
+            logger.debug(f"Generated latent shape: {latent.shape}, dtype: {latent.dtype}, device: {latent.device}")
+            dummy_data_list.append(latent)
 
     # Stack into [N, C, T, H, W]
-    dummy_data = torch.stack(dummy_data_list, dim=0)  # [100, 16, 1, 128, 128]
-    
+    dummy_data = torch.stack(dummy_data_list, dim=0)  # [100, 16, 1, 60, 104]
+    logger.info(f"Generated dummy_data shape: {dummy_data.shape}, dtype: {dummy_data.dtype}")
+
+    # Move to CPU before saving
+    dummy_data = dummy_data.cpu()
+    logger.debug("Moved dummy_data to CPU")
+    wan_t2v.model.cpu()
+    logger.debug("Moved WanModel to CPU")
+    wan_t2v.text_encoder.model.cpu()
+    logger.debug("Moved text encoder to CPU")
+    torch.cuda.empty_cache()
+    logger.debug("Cleared CUDA cache")
+
     return dummy_data, dummy_prompts
 
+
+# [INFO] Creating WanT2V pipeline.
+# [DEBUG] Using device: cuda
+# [INFO] Computed seq_len: 1560
+# [INFO] Generating sample 1/1 with prompt: A futuristic city floating among the clouds at sunset
+# [DEBUG] Noise shape: torch.Size([1, 16, 1, 60, 104]), dtype: torch.float32
+# [DEBUG] Context shape: torch.Size([512, 4096]), dtype: torch.bfloat16
+# [DEBUG] Converted context to dtype: torch.float32
+# [DEBUG] Noise_pred_cond shape: torch.Size([16, 1, 60, 104]), dtype: torch.float32
+# [DEBUG] Generated latent shape: torch.Size([16, 1, 60, 104]), dtype: torch.float32
+# [INFO] Generated dummy_data shape: torch.Size([1, 16, 1, 60, 104]), dtype: torch.float32
+# [INFO] Saved dummy_data shape: torch.Size([1, 16, 1, 60, 104]), dtype: torch.float32
 if __name__ == "__main__":
     # Load OmegaConf configuration
     config = OmegaConf.load("config.yaml")  # Path to your config file
-    dummy_data, dummy_prompts = generate_batch(config, num_samples=100)
-    
+    dummy_data, dummy_prompts = generate_batch(config, num_samples=10) # 9062 full set
+    dummy_data = dummy_data.cpu()
     # Save for training
     torch.save(dummy_data, "dummy_data.pt")
     torch.save(dummy_prompts, "dummy_prompts.pt")
