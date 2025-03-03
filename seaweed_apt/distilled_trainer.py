@@ -13,7 +13,7 @@ from wan.modules.model import WanModel
 from wan.text2video import WanT2V
 from wan.utils.utils import str2bool
 from logger import logger 
-
+import sys
 
 
 def train_consistency_distillation(
