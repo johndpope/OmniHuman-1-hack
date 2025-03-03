@@ -170,13 +170,13 @@ class T5SelfAttention(nn.Module):
     def forward(self, x, mask=None, pos_bias=None):
         logger.debug("Entering T5SelfAttention forward")
         e = pos_bias if self.shared_pos else self.pos_embedding(x.size(1), x.size(1))
-        logger.debug("Computed pos_bias")
+        # logger.debug("Computed pos_bias")
         x = self.norm1(x)
-        logger.debug("Applied norm1")
+        # logger.debug("Applied norm1")
         attn_output = self.attn(x, mask=mask, pos_bias=e)
-        logger.debug("Computed attention")
+        # logger.debug("Computed attention")
         x = x + attn_output  # Adjust based on your implementation
-        logger.debug("Added attention output")
+        # logger.debug("Added attention output")
         return x  # Simplified; add remaining steps as needed
 
 

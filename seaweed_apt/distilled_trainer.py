@@ -15,6 +15,7 @@ from wan.utils.utils import str2bool
 from logger import logger 
 
 
+
 def train_consistency_distillation(
     original_model,
     config,
@@ -41,7 +42,7 @@ def train_consistency_distillation(
         train_dataloader: DataLoader for training data
         checkpoint_dir: Directory with model checkpoints
         output_dir: Directory to save distilled model
-        device: Training device
+        device: Training device (e.g., 'cuda')
         accelerator: Accelerator instance
         num_epochs: Number of training epochs
         learning_rate: Learning rate for optimizer (paper uses 5e-6 for images)
@@ -50,9 +51,10 @@ def train_consistency_distillation(
         use_wandb: Whether to use Weights & Biases for logging
         project_name: WandB project name
         run_name: WandB run name
+        t5_fsdp: Whether to use FSDP for T5
     
     Returns:
-        distilled_model: The trained consistency-distilled model
+        distilled_model: The trained consistency-distilled model (EMA version)
     """
     logger.debug("Initializing consistency distillation training...")
     
@@ -79,7 +81,7 @@ def train_consistency_distillation(
     # Create optimizer (paper uses RMSProp with alpha=0.9, equivalent to Adam beta2=0.9)
     optimizer = optim.RMSprop(distilled_model.parameters(), lr=learning_rate, alpha=0.9)
 
-    # Set up accelerator
+    # Set up accelerator (prepares distilled model, optimizer, and dataloader)
     distilled_model, optimizer, train_dataloader = accelerator.prepare(
         distilled_model, optimizer, train_dataloader
     )
@@ -89,23 +91,24 @@ def train_consistency_distillation(
     distilled_model.train()
     
     # Create T5 text encoder for processing text prompts
-
     from wan.modules.t5 import T5EncoderModel
     from wan.distributed.fsdp import shard_model
     from functools import partial
     shard_fn = partial(shard_model, device_id=0)
-    t5_device = torch.device('cpu')
+    t5_device = torch.device('cpu')  # Start on CPU for VRAM management
     logger.debug(f"Initializing text encoder on {t5_device}...")
     text_encoder = T5EncoderModel(
         text_len=config.text_len,
         dtype=config.t5_dtype,
-        device=t5_device, # T5EncoderModel is CPU-only unless you have a GPU with 24GB+ VRAM
+        device=t5_device,  # T5EncoderModel is CPU-only unless GPU has 24GB+ VRAM
         checkpoint_path=f"{checkpoint_dir}/{config.t5_checkpoint}",
         tokenizer_path=f"{checkpoint_dir}/{config.t5_tokenizer}",
         shard_fn=shard_fn if t5_fsdp else None,
     )
-    # Negative prompt for CFG (paper uses fixed negative prompt)
+    
+    # Negative prompt for CFG (from config)
     negative_prompt = config.sample_neg_prompt or ""  # Empty string if not specified
+    
     # EMA setup (paper uses decay rate of 0.995)
     logger.debug("Setting up EMA model...")
     ema_model = WanModel.from_pretrained(checkpoint_dir)
@@ -116,9 +119,7 @@ def train_consistency_distillation(
         with torch.no_grad():
             for target_param, source_param in zip(target_model.parameters(), source_model.parameters()):
                 target_param.data.mul_(decay).add_(source_param.data, alpha=1 - decay)
-    
 
-    
     def process_text(prompts):
         """
         Process text prompts with safeguards against hanging.
@@ -130,90 +131,93 @@ def train_consistency_distillation(
         ids, mask = text_encoder.tokenizer(prompts, return_mask=True)
         logger.debug(f"Tokenizer returned: ids shape={ids.shape}, mask shape={mask.shape}")
         
-        # Ensure the text encoder model is on CPU
-        if hasattr(text_encoder.model, 'to'):
-            text_encoder.model = text_encoder.model.to('cpu')
+        # Move T5 to GPU for processing
+        logger.debug(f"Moving text encoder to {device}")
+        text_encoder.model = text_encoder.model.to(device)
         
         # Process with a timeout mechanism
         with torch.no_grad():
-            # Limiting batch size or sequence length if needed
             max_len = min(512, ids.shape[1])
-            ids = ids[:, :max_len]
-            mask = mask[:, :max_len]
-            
-            ids = ids.to('cpu')  # Ensure on CPU
-            mask = mask.to('cpu')
+            ids = ids[:, :max_len].to(device)
+            mask = mask[:, :max_len].to(device)
             
             logger.debug(f"Running text encoder model with ids shape={ids.shape}, mask shape={mask.shape}")
-            
-            # Actually run the model
             try:
                 context = text_encoder.model(ids, mask)
                 logger.debug(f"Text encoder completed successfully, output shape: {context.shape}")
             except Exception as e:
                 logger.error(f"Error in text encoder: {str(e)}")
-                # Fallback to a zero tensor if processing fails
-                context = torch.zeros((ids.shape[0], max_len, text_encoder.model.dim), dtype=torch.float32)
+                context = torch.zeros((ids.shape[0], max_len, text_encoder.model.dim), dtype=torch.float32, device=device)
                 logger.debug("Using fallback zero tensor for context")
         
-        # Move output to the target device for further processing
-        logger.debug(f"Moving context to device: {device}")
-        result = context.to(device)
-        logger.debug(f"Final context shape: {result.shape}")
-        return result
+        # Move T5 back to CPU after processing
+        logger.debug("Moving text encoder back to CPU")
+        text_encoder.model = text_encoder.model.to('cpu')
+        torch.cuda.empty_cache()
+        
+        logger.debug(f"Final context shape: {context.shape}")
+        return context
+
+    # Initialize stats
+    total_loss = 0.0
+    step = 0
 
     # Ensure models start on CPU to free VRAM initially
     text_encoder.model = text_encoder.model.to('cpu')
     original_model = original_model.to('cpu')
     logger.debug("Initialized models on CPU")
 
-    # Enhanced training loop with detailed logging
+    # Enhanced training loop with detailed logging and device management
     for epoch in range(num_epochs):
         logger.debug(f"Starting epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
             logger.debug(f"Batch {batch_idx}: samples shape={samples.shape}, text_prompts length={len(text_prompts)}")
             logger.debug(f"Sample text prompt example: {text_prompts[0][:50]}...")
-
+            
             # Move samples to device
             logger.debug(f"Moving samples to device: {device}")
             samples = samples.to(device)
-
-            # Process text prompts (unchanged)
+            
+            # Process text prompts with T5 on GPU
             logger.debug("Processing positive text prompts")
             context = process_text(text_prompts)
-            logger.debug(f"Positive context shape: {context[0].shape if isinstance(context, list) else context.shape}")
+            logger.debug(f"Positive context shape: {context.shape}")
+            
             logger.debug("Processing negative text prompts")
             context_null = process_text([negative_prompt] * len(text_prompts))
-            logger.debug(f"Negative context shape: {context_null[0].shape if isinstance(context_null, list) else context_null.shape}")
-
+            logger.debug(f"Negative context shape: {context_null.shape}")
+            
             # Generate random noise
             logger.debug("Generating random noise")
-            noise = torch.randn_like(samples)  # Shape: [1, 16, 1, 128, 128]
+            noise = torch.randn_like(samples)  # Shape: [B, 16, 1, 128, 128]
             logger.debug(f"Noise shape: {noise.shape}")
-
-            # Adjust noise to 4D
             noise = noise.squeeze(0)  # Shape: [16, 1, 128, 128]
             logger.debug(f"Adjusted noise shape: {noise.shape}")
-
+            
             # Final timestep for one-step prediction
             logger.debug("Creating timestep tensor")
             timestep = torch.ones(samples.shape[0], device=device) * config.num_train_timesteps
             logger.debug(f"Timestep shape: {timestep.shape}, value: {timestep[0].item()}")
-
-            # Teacher prediction
+            
+            # Move original_model to GPU for teacher prediction
+            logger.debug(f"Moving original_model to {device}")
+            original_model = original_model.to(device)
+            torch.cuda.empty_cache()
+            
+            # Teacher prediction with CFG
             logger.debug("Starting teacher model prediction")
             with torch.no_grad():
-                # Unconditional prediction
                 logger.debug("Running unconditional prediction with original model")
                 v_uncond = original_model(
-                    [noise],  # List of 4D tensor
+                    [noise],
                     t=timestep,
                     context=context_null,
                     seq_len=config.seq_len
                 )[0]
                 logger.debug(f"Unconditional prediction shape: {v_uncond.shape}")
-
+                
+                logger.debug("Running conditional prediction with original model")
                 v_cond = original_model(
                     [noise],
                     t=timestep,
@@ -221,19 +225,22 @@ def train_consistency_distillation(
                     seq_len=config.seq_len
                 )[0]
                 logger.debug(f"Conditional prediction shape: {v_cond.shape}")
-                # CFG: v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
+                
                 logger.debug(f"Applying classifier-free guidance with scale: {cfg_scale}")
                 v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
                 logger.debug(f"Teacher prediction shape: {v_teacher.shape}")
-                
-
+            
+            # Move original_model back to CPU
+            logger.debug("Moving original_model back to CPU")
+            original_model = original_model.to('cpu')
+            torch.cuda.empty_cache()
             
             # Student prediction
             logger.debug("Running student model prediction")
             v_student = distilled_model(
-                [noise], 
-                t=timestep, 
-                context=context, 
+                [noise],
+                t=timestep,
+                context=context,
                 seq_len=config.seq_len
             )[0]
             logger.debug(f"Student prediction shape: {v_student.shape}")
@@ -274,7 +281,6 @@ def train_consistency_distillation(
             if accelerator.is_main_process and batch_idx % 10 == 0:
                 avg_loss = total_loss / (batch_idx + 1)
                 logger.debug(f"Progress update: Epoch {epoch+1}, Batch {batch_idx}, Avg Loss: {avg_loss:.6f}")
-                logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {avg_loss:.6f}")
             
             # Save checkpoint with EMA weights
             if step % save_interval == 0 and accelerator.is_main_process:
@@ -282,7 +288,6 @@ def train_consistency_distillation(
                 logger.debug(f"Saving checkpoint to {checkpoint_path}")
                 unwrapped_ema = accelerator.unwrap_model(ema_model)
                 torch.save(unwrapped_ema.state_dict(), checkpoint_path)
-                logger.debug("Checkpoint saved successfully")
                 logger.debug(f"Saved EMA checkpoint to {checkpoint_path}")
         
         # Save epoch checkpoint with EMA weights
@@ -291,102 +296,15 @@ def train_consistency_distillation(
             logger.debug(f"Saving epoch checkpoint to {checkpoint_path}")
             unwrapped_ema = accelerator.unwrap_model(ema_model)
             torch.save(unwrapped_ema.state_dict(), checkpoint_path)
-            logger.debug("Epoch checkpoint saved successfully")
             logger.debug(f"Saved EMA epoch checkpoint to {checkpoint_path}")
         
         logger.debug(f"Completed epoch {epoch+1}/{num_epochs}")
-        total_loss = 0.0
-        logger.debug(f"Epoch {epoch+1}/{num_epochs}")
-        
-        for batch_idx, (samples, text_prompts) in enumerate(tqdm(train_dataloader)):
-            logger.debug(f"Processing text prompts for batch {batch_idx}")
-
-            # Process text prompts
-            context = process_text(text_prompts)
-            context_null = process_text([negative_prompt] * len(text_prompts))
-            # Generate random noise
-            noise = torch.randn_like(samples)
-            
-            # Final timestep for one-step prediction (paper uses T)
-            timestep = torch.ones(samples.shape[0], device=device) * config.num_train_timesteps
-            
-            # Teacher prediction with CFG
-            with torch.no_grad():
-                # Unconditional prediction
-                v_uncond = original_model(
-                    [noise], 
-                    t=timestep, 
-                    context=context_null, 
-                    seq_len=config.seq_len
-                )[0]
-                
-                # Conditional prediction
-                v_cond = original_model(
-                    [noise], 
-                    t=timestep, 
-                    context=context, 
-                    seq_len=config.seq_len
-                )[0]
-                
-                # CFG: v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
-                v_teacher = v_uncond + cfg_scale * (v_cond - v_uncond)
-            
-            # Student prediction
-            v_student = distilled_model(
-                [noise], 
-                t=timestep, 
-                context=context, 
-                seq_len=config.seq_len
-            )[0]
-            
-            # MSE loss (paper uses mean squared error for consistency distillation)
-            loss = F.mse_loss(v_student, v_teacher)
-            
-            # Backpropagation
-            accelerator.backward(loss)
-            optimizer.step()
-            optimizer.zero_grad()
-            
-            # Update EMA
-            update_ema(ema_model, distilled_model, ema_decay)
-            
-            # Update stats
-            total_loss += loss.item()
-            step += 1
-            
-            # Log to wandb
-            if use_wandb and accelerator.is_main_process and batch_idx % 5 == 0:
-                wandb.log({
-                    "step": step,
-                    "batch_loss": loss.item(),
-                    "avg_loss": total_loss / (batch_idx + 1),
-                    "epoch": epoch + 1,
-                })
-            
-            # Print progress
-            if accelerator.is_main_process and batch_idx % 10 == 0:
-                avg_loss = total_loss / (batch_idx + 1)
-                logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {avg_loss:.6f}")
-            
-            # Save checkpoint with EMA weights
-            if step % save_interval == 0 and accelerator.is_main_process:
-                checkpoint_path = f"{output_dir}/consistency_model_step_{step}.pt"
-                unwrapped_ema = accelerator.unwrap_model(ema_model)
-                torch.save(unwrapped_ema.state_dict(), checkpoint_path)
-                logger.debug(f"Saved EMA checkpoint to {checkpoint_path}")
-        
-        # Save epoch checkpoint with EMA weights
-        if accelerator.is_main_process:
-            checkpoint_path = f"{output_dir}/consistency_model_epoch_{epoch+1}.pt"
-            unwrapped_ema = accelerator.unwrap_model(ema_model)
-            torch.save(unwrapped_ema.state_dict(), checkpoint_path)
-            logger.debug(f"Saved EMA epoch checkpoint to {checkpoint_path}")
-        
         total_loss = 0.0
     
     # Save final EMA model
     if accelerator.is_main_process:
         final_path = f"{output_dir}/consistency_model_final.pt"
+        logger.debug(f"Saving final EMA model to {final_path}")
         unwrapped_ema = accelerator.unwrap_model(ema_model)
         torch.save(unwrapped_ema.state_dict(), final_path)
         logger.debug(f"Saved final EMA consistency model to {final_path}")
@@ -395,6 +313,7 @@ def train_consistency_distillation(
         wandb.finish()
     
     return accelerator.unwrap_model(ema_model)  # Return EMA model as per paper
+    
 
 
 if __name__ == "__main__":
@@ -469,7 +388,7 @@ if __name__ == "__main__":
         use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
         t5_cpu=args.t5_cpu
     ).model.to(device)
-    
+        
 
     class TextVideoDataset(torch.utils.data.Dataset):
         def __init__(self, video_tensors, text_prompts):
@@ -490,11 +409,19 @@ if __name__ == "__main__":
         def __getitem__(self, idx):
             return self.video_tensors[idx], self.text_prompts[idx]
 
-    # Create proper dataset with videos and text prompts
-    N = 10
-    dummy_data = torch.randn(N, 16, 1, 128, 128)  # [N, C, T, H, W]
-    dummy_prompts = ["A beautiful landscape"] * N
-    train_dataset = TextVideoDataset(dummy_data, dummy_prompts)
+    # Check for generated data files
+    data_file = "dummy_data.pt"
+    prompts_file = "dummy_prompts.pt"
+    if not (os.path.exists(data_file) and os.path.exists(prompts_file)):
+        logging.error(f"Required files {data_file} and/or {prompts_file} not found.")
+        logging.info("Please run generate.py to create the dummy data first.")
+        sys.exit(1)  # Exit with error code 1
+
+    # Load generated data
+    dummy_data = torch.load(data_file)  # [100, 16, 1, 128, 128]
+    dummy_prompts = torch.load(prompts_file)  # List of 100 prompts
+    logging.info(f"Loaded dummy_data with shape: {dummy_data.shape}")
+    logging.info(f"Loaded {len(dummy_prompts)} prompts")
 
 
 
