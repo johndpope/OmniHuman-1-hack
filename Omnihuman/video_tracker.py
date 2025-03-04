@@ -261,9 +261,7 @@ import os
 import glob
 from pathlib import Path
 import h5py
-import logging
-
-logger = logging.getLogger(__name__)
+from logger import logger
 
 def clean_window_cache(cache_dir: str = "cache", pattern: str = "window_*.h5"):
     """

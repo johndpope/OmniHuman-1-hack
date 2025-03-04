@@ -1,7 +1,6 @@
 import logging
 from rich.logging import RichHandler
 import warnings
-
 import os
 
 # "The quieter you become, the more you are able to hear"
@@ -13,14 +12,10 @@ import torch.autograd.anomaly_mode as anomaly_mode
 import logging
 import sys
 from typing import Dict, Any, Optional
-
-import logging
-from rich.logging import RichHandler
-import torch
-import torch.autograd.profiler as profiler
 import sys
-from typing import Dict, Any, Optional
 from rich.traceback import install
+from rich.console import Console
+from rich.theme import Theme
 
 
 
@@ -93,21 +88,15 @@ warnings.filterwarnings(
     category=UserWarning
 )
 
+# Configure rich console
+console = Console(force_terminal=True)
 
-
+# Set up handler
+rich_handler = RichHandler(console=console, rich_tracebacks=True, markup=True)
 
 # Configure logging with both RichHandler and FileHandler
 file_handler = logging.FileHandler("project.log")  # Log to a file
 file_handler.setLevel(log_level)
-
- # Configure rich handler
-rich_handler = RichHandler(
-    rich_tracebacks=True,
-    markup=True,
-    show_time=True,
-    show_path=True
-)
-rich_handler.setLevel(log_level)
 
 logging.basicConfig(
     level=log_level,

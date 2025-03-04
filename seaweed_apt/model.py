@@ -83,11 +83,16 @@ class WanCrossAttentionDiscriminatorBlock(nn.Module):
 
 
 class WanAPTDiscriminator(nn.Module):
-    def __init__(self, wan_model):
+    def __init__(self, wan_model,use_checkpoint=False):
         super().__init__()
+        
         # Initialize from pre-trained Wan
         self.backbone = copy.deepcopy(wan_model)
         
+         # Enable gradient checkpointing if the backbone supports it
+        if hasattr(self.backbone, 'use_checkpoint'):
+            self.backbone.use_checkpoint = use_checkpoint
+            
         # Add cross-attention blocks at layers 16, 26, and 36
         self.cross_attn_16 = WanCrossAttentionDiscriminatorBlock(
             dim=self.backbone.dim,
@@ -181,10 +186,13 @@ class WanAPTDiscriminator(nn.Module):
 
 
 class WanAPTGenerator(nn.Module):
-    def __init__(self, distilled_model, final_timestep=1000):
+    def __init__(self, distilled_model, final_timestep=1000, use_checkpoint=False):
         super().__init__()
         # Initialize from distilled model
         self.model = distilled_model
+          # Enable gradient checkpointing if the underlying model supports it
+        if hasattr(self.model, 'use_checkpoint'):
+            self.model.use_checkpoint = use_checkpoint
         self.final_timestep = final_timestep
     
     def forward(self, z, context, seq_len):

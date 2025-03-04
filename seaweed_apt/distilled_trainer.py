@@ -1,3 +1,4 @@
+from logger import logger 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,9 +13,10 @@ from accelerate import Accelerator
 from wan.modules.model import WanModel
 from wan.text2video import WanT2V
 from wan.utils.utils import str2bool
-from logger import logger 
-import sys
 
+import sys
+# import os
+# os.environ["FORCE_COLOR"] = "true"
 
 def train_consistency_distillation(
     original_model,
@@ -32,6 +34,8 @@ def train_consistency_distillation(
     project_name="wan-consistency-distillation",
     run_name=None,
     t5_fsdp=False,
+    use_gradient_checkpointing=True # for 24GB GPU
+    
 ):
     """
     Train a consistency-distilled model from the original Wan model.
@@ -72,9 +76,12 @@ def train_consistency_distillation(
                 "cfg_scale": cfg_scale,
                 "save_interval": save_interval,
                 "method": "consistency_distillation",
+                "use_gradient_checkpointing": use_gradient_checkpointing,
+
             }
         )
-    
+
+
     # Initialize distilled model from scratch with same architecture
     distilled_model = WanModel.from_pretrained(checkpoint_dir)
     
@@ -111,7 +118,7 @@ def train_consistency_distillation(
     
     # EMA setup (paper uses decay rate of 0.995)
     logger.debug("Setting up EMA model...")
-    ema_model = WanModel.from_pretrained(checkpoint_dir)
+    ema_model = WanModel.from_pretrained(checkpoint_dir,use_checkpoint=use_gradient_checkpointing)
     ema_model.eval()
     ema_decay = 0.995
     
@@ -253,8 +260,26 @@ def train_consistency_distillation(
             
             # Update EMA
             logger.debug("Updating EMA model")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            distilled_model.to(device)
+            ema_model.to(device)
             update_ema(ema_model, distilled_model, ema_decay)
+
+
+            logger.debug(f"Before clean up - GPU memory allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GiB")
+            logger.debug(f"GPU memory reserved: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GiB")
+
+            logger.debug("Cleaning up GPU memory")
+            del v_uncond, v_cond, v_teacher, v_student, noise, context, context_null, loss
+            torch.cuda.empty_cache()
+
+            # Ensure no lingering references
+            samples = samples.cpu()
+            optimizer.zero_grad(set_to_none=True)  # Clear gradients more aggressively
             
+            logger.debug(f"After - GPU memory allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GiB")
+            logger.debug(f"GPU memory reserved: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GiB")
+
             # Update stats
             total_loss += loss.item()
             step += 1

@@ -1,0 +1,27 @@
+Wed Mar  5 05:13:27 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 555.42.06              Driver Version: 555.42.06      CUDA Version: 12.5     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090        Off |   00000000:01:00.0  On |                  N/A |
+| 32%   55C    P8             33W /  370W |    1495MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A      3186      G   /usr/lib/xorg/Xorg                            862MiB |
+|    0   N/A  N/A      3532      G   /usr/bin/gnome-shell                          126MiB |
+|    0   N/A  N/A     56151      G   ...erProcess --variations-seed-version        129MiB |
+|    0   N/A  N/A    382353      G   ...ures=SpareRendererForSitePerProcess         77MiB |
+|    0   N/A  N/A    388934    C+G   ...seed-version=20250228-151446.092000        212MiB |
++-----------------------------------------------------------------------------------------+
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mf-distill-js-run1[0m at: [34mhttps://wandb.ai/snoozie/seaweed-apt-distillation/runs/lu4gwsrw[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20250305_051413-lu4gwsrw/logs[0m

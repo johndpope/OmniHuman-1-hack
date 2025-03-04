@@ -25,7 +25,8 @@ def train_seaweed_apt(config,
                       accelerator,
                       use_wandb=False,
                       project_name="seaweed-apt-training",
-                      run_name=None):
+                      run_name=None,
+                      use_checkpoint=True): 
     """
     Train Seaweed APT with Wan as the base model using Accelerate
     
@@ -63,8 +64,11 @@ def train_seaweed_apt(config,
         )
     
     # Initialize generator and discriminator
-    generator = WanAPTGenerator(distilled_model, final_timestep=config.num_train_timesteps)
-    discriminator = WanAPTDiscriminator(original_model)
+    generator = WanAPTGenerator(distilled_model, 
+                               final_timestep=config.num_train_timesteps,
+                               use_checkpoint=use_checkpoint)
+    discriminator = WanAPTDiscriminator(original_model,
+                                       use_checkpoint=use_checkpoint)
     
     # Setup optimizers
     g_optimizer = optim.RMSprop(generator.parameters(), 

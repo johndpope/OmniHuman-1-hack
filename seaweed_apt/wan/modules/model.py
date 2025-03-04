@@ -6,6 +6,8 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+import torch.utils.checkpoint as checkpoint
+
 
 from .attention import flash_attention
 
@@ -384,7 +386,9 @@ class WanModel(ModelMixin, ConfigMixin):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 use_checkpoint=False):  # Add gradient checkpointing parameter
+
         r"""
         Initialize the diffusion model backbone.
 
@@ -440,6 +444,8 @@ class WanModel(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+
+        self.use_checkpoint = use_checkpoint  # Store the checkpointing flag
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -560,8 +566,20 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        # Process through transformer blocks with optional gradient checkpointing
+        for i, block in enumerate(self.blocks):
+            if self.use_checkpoint and self.training:
+                # Custom function that preserves the kwargs dictionary structure
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(inputs[0], **{k: inputs[i+1] for i, k in enumerate(kwargs.keys())})
+                    return custom_forward
+                
+                # Prepare inputs for checkpointing (must be tensors)
+                checkpoint_inputs = [x] + list(kwargs.values())
+                x = checkpoint.checkpoint(create_custom_forward(block), *checkpoint_inputs)
+            else:
+                x = block(x, **kwargs)
 
         # head
         x = self.head(x, e)

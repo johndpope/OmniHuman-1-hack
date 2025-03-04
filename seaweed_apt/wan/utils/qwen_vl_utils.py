@@ -2,8 +2,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 from __future__ import annotations
 
-import base64
-import logging
+import base64a
 import math
 import os
 import sys
@@ -20,7 +19,7 @@ from PIL import Image
 from torchvision import io, transforms
 from torchvision.transforms import InterpolationMode
 
-logger = logging.getLogger(__name__)
+from logger import logger
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
