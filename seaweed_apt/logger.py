@@ -18,6 +18,23 @@ from rich.console import Console
 from rich.theme import Theme
 
 
+# Add this near the top of your logger.py file
+
+# Create a special __getattr__ function for the module itself
+def __getattr__(name):
+    if name in ['debug', 'info', 'warning', 'error', 'critical']:
+        raise AttributeError(
+            f"AttributeError: module 'logger' has no attribute '{name}'\n\n"
+            f"USAGE ERROR: It seems you're trying to use 'logger.{name}(...)' directly.\n"
+            f"The correct usage is:\n\n"
+            f"    from logger import logger\n"
+            f"    logger.{name}('your message')\n\n"
+            f"Please update your imports and try again."
+        )
+    raise AttributeError(f"module 'logger' has no attribute '{name}'")
+
+# Make sure this appears in the module namespace
+__all__ = ['logger', 'TorchDebugger', 'console']
 
     
 # log_level = logging.WARNING    
@@ -113,6 +130,7 @@ logger.setLevel(log_level)
 from rich.traceback import install
 # Enable rich tracebacks globally
 install()
+
 
 
 
