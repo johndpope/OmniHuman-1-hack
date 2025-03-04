@@ -18,8 +18,6 @@ from rich.console import Console
 from rich.theme import Theme
 
 
-# Add this near the top of your logger.py file
-
 # Create a special __getattr__ function for the module itself
 def __getattr__(name):
     if name in ['debug', 'info', 'warning', 'error', 'critical']:
@@ -36,7 +34,8 @@ def __getattr__(name):
 # Make sure this appears in the module namespace
 __all__ = ['logger', 'TorchDebugger', 'console']
 
-    
+
+# colors not working ? move the import statement to the top of imports 
 # log_level = logging.WARNING    
 # log_level = logging.INFO
 log_level = logging.DEBUG

@@ -270,7 +270,7 @@ def train_consistency_distillation(
             logger.debug(f"GPU memory reserved: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GiB")
 
             logger.debug("Cleaning up GPU memory")
-            del v_uncond, v_cond, v_teacher, v_student, noise, context, context_null, loss
+            del v_uncond, v_cond, v_teacher, v_student, noise, context, context_null
             torch.cuda.empty_cache()
 
             # Ensure no lingering references
