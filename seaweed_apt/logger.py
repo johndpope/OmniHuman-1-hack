@@ -133,6 +133,50 @@ install()
 
 
 
+def debug_memory(location="", show_tensors=False):
+    """Print memory usage statistics for GPU with optional tensor details"""
+    import gc
+    
+    t = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    r = torch.cuda.memory_reserved(0) / 1024**3
+    a = torch.cuda.memory_allocated(0) / 1024**3
+    f = t - r  # free inside reserved
+    
+    logger.debug(f"MEMORY AT {location}: {t:.2f} GiB total, {r:.2f} GiB reserved, "
+                f"{a:.2f} GiB allocated, {f:.2f} GiB free")
+    
+    # Show the objects occupying CUDA memory
+    if show_tensors:
+        tensors = []
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) and obj.is_cuda:
+                    tensors.append({
+                        'shape': tuple(obj.shape),
+                        'size_mb': obj.element_size() * obj.nelement() / 1024**2,
+                        'dtype': obj.dtype
+                    })
+            except:
+                pass
+        
+        # Sort by size (largest first)
+        tensors.sort(key=lambda x: x['size_mb'], reverse=True)
+        
+        # Show top 10 tensors
+        if tensors:
+            logger.debug(f"Top CUDA tensors at {location}:")
+            for i, t in enumerate(tensors[:10]):
+                logger.debug(f"  {i+1}. {t['shape']} - {t['size_mb']:.2f} MB - {t['dtype']}")
+    
+    memory_info = {
+        'total': t,
+        'reserved': r,
+        'allocated': a,
+        'free': f
+    }
+    
+    return memory_info
+    
 class TorchDebugger:
     """Helper class to enable comprehensive PyTorch debugging with version compatibility"""
     

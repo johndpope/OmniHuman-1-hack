@@ -1,4 +1,4 @@
-from logger import logger 
+from logger import logger,debug_memory 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +13,7 @@ from accelerate import Accelerator
 from wan.modules.model import WanModel
 from wan.text2video import WanT2V
 from wan.utils.utils import str2bool
+import gc
 
 import sys
 # import os
@@ -129,7 +130,7 @@ def train_consistency_distillation(
 
     def process_text(prompts):
         """
-        Process text prompts with safeguards against hanging.
+        Process text prompts with improved memory management.
         """
         logger.debug(f"Processing text prompts: {prompts[:1]}")
         
@@ -138,32 +139,65 @@ def train_consistency_distillation(
         ids, mask = text_encoder.tokenizer(prompts, return_mask=True)
         logger.debug(f"Tokenizer returned: ids shape={ids.shape}, mask shape={mask.shape}")
         
-        # Move T5 to GPU for processing
-        logger.debug(f"Moving text encoder to {device}")
-        text_encoder.model = text_encoder.model.to(device)
+        # Process in smaller chunks if the batch is large
+        batch_size = ids.shape[0]
+        max_len = min(512, ids.shape[1])
         
-        # Process with a timeout mechanism
-        with torch.no_grad():
-            max_len = min(512, ids.shape[1])
-            ids = ids[:, :max_len].to(device)
-            mask = mask[:, :max_len].to(device)
+        # Pre-allocate the output tensor on CPU
+        context_shape = (batch_size, max_len, text_encoder.model.dim)
+        full_context = torch.zeros(context_shape, dtype=torch.float32, device='cpu')
+        
+        # Process in smaller chunks to reduce peak memory
+        chunk_size = 1  # Process one prompt at a time
+        
+        for i in range(0, batch_size, chunk_size):
+            # Clear CUDA cache before processing each chunk
+            torch.cuda.empty_cache()
+            gc.collect()
             
-            logger.debug(f"Running text encoder model with ids shape={ids.shape}, mask shape={mask.shape}")
-            try:
-                context = text_encoder.model(ids, mask)
-                logger.debug(f"Text encoder completed successfully, output shape: {context.shape}")
-            except Exception as e:
-                logger.error(f"Error in text encoder: {str(e)}")
-                context = torch.zeros((ids.shape[0], max_len, text_encoder.model.dim), dtype=torch.float32, device=device)
-                logger.debug("Using fallback zero tensor for context")
+            # Define the end of the current chunk
+            end = min(i + chunk_size, batch_size)
+            
+            # Get the current chunk
+            chunk_ids = ids[i:end, :max_len].to(device)
+            chunk_mask = mask[i:end, :max_len].to(device)
+            
+            # Move only the necessary part of the model to GPU
+            logger.debug(f"Moving text encoder to {device} for chunk {i} to {end}")
+            text_encoder.model = text_encoder.model.to(device)
+            
+            # Process the chunk
+            with torch.no_grad():
+                try:
+                    logger.debug(f"Running text encoder on chunk with shape: {chunk_ids.shape}")
+                    chunk_context = text_encoder.model(chunk_ids, chunk_mask)
+                    logger.debug(f"Chunk context output shape: {chunk_context.shape}")
+                    
+                    # Store the result on CPU to save GPU memory
+                    full_context[i:end] = chunk_context.cpu()
+                    
+                except Exception as e:
+                    logger.error(f"Error in text encoder for chunk {i} to {end}: {str(e)}")
+                    # Create a fallback tensor directly on CPU
+                    full_context[i:end] = torch.zeros((end-i, max_len, text_encoder.model.dim), 
+                                                    dtype=torch.float32)
+            
+            # Move model back to CPU and clear GPU memory
+            logger.debug(f"Moving text encoder back to CPU after chunk {i} to {end}")
+            text_encoder.model = text_encoder.model.to('cpu')
+            
+            # Explicitly delete tensors
+            del chunk_ids, chunk_mask
+            if 'chunk_context' in locals():
+                del chunk_context
+                
+            # Force CUDA memory cleanup
+            torch.cuda.empty_cache()
+            gc.collect()
         
-        # Move T5 back to CPU after processing
-        logger.debug("Moving text encoder back to CPU")
-        text_encoder.model = text_encoder.model.to('cpu')
-        torch.cuda.empty_cache()
-        
-        logger.debug(f"Final context shape: {context.shape}")
-        return context.to(torch.float32)
+        logger.debug(f"Final context shape: {full_context.shape}")
+        # Return the context, moving to GPU only when needed
+        return full_context.to(device)
 
     # Initialize stats
     total_loss = 0.0
@@ -261,9 +295,11 @@ def train_consistency_distillation(
             # Update EMA
             logger.debug("Updating EMA model")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            distilled_model.to(device)
+            distilled_model.to(device)  # Should already be on device
             ema_model.to(device)
             update_ema(ema_model, distilled_model, ema_decay)
+            ema_model.to('cpu')  # Move it back to CPU immediately
+            torch.cuda.empty_cache()
 
 
             logger.debug(f"Before clean up - GPU memory allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GiB")
