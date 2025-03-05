@@ -18,6 +18,8 @@ from wan.configs import WAN_CONFIGS
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_video, str2bool
 import argparse
+from distilled_trainer import TextVideoDataset
+
 
 # Example prompt for fallback
 EXAMPLE_PROMPT = {
@@ -210,33 +212,30 @@ def generate_batch(config, args, num_samples=100):
     timestep = torch.tensor([wan_t2v.num_train_timesteps - 1], device=device, dtype=torch.float32)
     cfg_scale = 7.5
 
+    # In generate.py, within generate_batch function
     for i in range(num_samples):
         seed = base_seed + i
         seed_g = torch.Generator(device=device)
         seed_g.manual_seed(seed)
         
-        # Generate noise with correct shape
         noise = torch.randn(
-            16,           # Channels (match model expectation)
-            1,            # Depth
-            60,           # Height
-            104,          # Width
+            target_shape,  # [16, 1, 60, 104]
             dtype=torch.float32,
             device=device,
             generator=seed_g
         )
-        
         noise_list.append(noise.cpu())
 
         with torch.no_grad():
             context = positive_contexts[i].to(device)
             context_null = negative_context.to(device)
-            noise_input = [noise]  # Shape: [16, 1, 60, 104]
-            noise_pred_cond = wan_t2v.model(noise_input, t=timestep, context=[context], seq_len=seq_len)[0]
-            noise_pred_uncond = wan_t2v.model(noise_input, t=timestep, context=[context_null], seq_len=seq_len)[0]
-            latent = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-            dummy_data_list.append(latent.cpu())
-            v_teacher_list.append(latent.cpu())
+            noise_input = noise  # Shape: [16, 1, 60, 104]
+            # Predict velocity field v at timestep T
+            noise_pred_cond = wan_t2v.model(noise_input.unsqueeze(0), t=timestep, context=[context], seq_len=seq_len)[0]
+            noise_pred_uncond = wan_t2v.model(noise_input.unsqueeze(0), t=timestep, context=[context_null], seq_len=seq_len)[0]
+            v_teacher = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)  # Velocity field
+            dummy_data_list.append(noise.cpu())  # Store noise as input
+            v_teacher_list.append(v_teacher.cpu())
         torch.cuda.empty_cache()
 
     # Compile data dictionary with shape checks
@@ -272,108 +271,96 @@ def generate_batch(config, args, num_samples=100):
     return data_dict
 
 # Adjusted Dataset for Testing
-class TextVideoDataset(Dataset):
-    """
-    Dataset for handling precomputed tensors for APT (Adversarial Post-Training).
-    This version handles batch dimension issues and ensures correct tensor shapes.
-    """
-    def __init__(self, data_path):
-        """
-        Initialize dataset from precomputed tensors.
+# class TextVideoDataset(Dataset):
+#     """
+#     Dataset for handling precomputed tensors for APT (Adversarial Post-Training).
+#     This version handles batch dimension issues and ensures correct tensor shapes.
+#     """
+#     def __init__(self, data_path):
+#         """
+#         Initialize dataset from precomputed tensors.
         
-        Args:
-            data_path (str): Path to precomputed tensor file (.pt)
-        """
-        logger.info(f"Loading data from {data_path}")
-        if not os.path.exists(data_path):
-            raise FileNotFoundError(f"Data file {data_path} not found. Please generate data first.")
+#         Args:
+#             data_path (str): Path to precomputed tensor file (.pt)
+#         """
+#         logger.info(f"Loading data from {data_path}")
+#         if not os.path.exists(data_path):
+#             raise FileNotFoundError(f"Data file {data_path} not found. Please generate data first.")
         
-        # Load precomputed data
-        data_dict = torch.load(data_path, map_location='cpu')
+#         # Load precomputed data
+#         data_dict = torch.load(data_path, map_location='cpu')
         
-        # Extract tensors with shape validation
-        self.samples = data_dict['dummy_data']  # Shape: [num_samples, 16, 1, 60, 104]
-        self.noise = data_dict['noise']          # Shape: [num_samples, 16, 1, 60, 104]
-        self.positive_contexts = data_dict['positive_contexts']  # List of [512, 4096] tensors
-        self.negative_context = data_dict['negative_context']    # Shape: [512, 4096]
-        self.v_teacher = data_dict['v_teacher']  # Shape: [num_samples, 16, 1, 60, 104]
+#         # Extract tensors with shape validation
+#         self.samples = data_dict['dummy_data']  # Shape: [num_samples, 16, 1, 60, 104]
+#         self.noise = data_dict['noise']          # Shape: [num_samples, 16, 1, 60, 104]
+#         self.positive_contexts = data_dict['positive_contexts']  # List of [512, 4096] tensors
+#         self.negative_context = data_dict['negative_context']    # Shape: [512, 4096]
+#         self.v_teacher = data_dict['v_teacher']  # Shape: [num_samples, 16, 1, 60, 104]
         
-        self.num_samples = len(self.samples)
+#         self.num_samples = len(self.samples)
         
-        # Log shapes for debugging
-        logger.info(f"Dataset initialized with {self.num_samples} samples")
-        logger.info(f"Tensor shapes: samples={self.samples.shape}, noise={self.noise.shape}, "
-                   f"positive_contexts[0]={self.positive_contexts[0].shape}, "
-                   f"negative_context={self.negative_context.shape}, "
-                   f"v_teacher={self.v_teacher.shape}")
+#         # Log shapes for debugging
+#         logger.info(f"Dataset initialized with {self.num_samples} samples")
+#         logger.info(f"Tensor shapes: samples={self.samples.shape}, noise={self.noise.shape}, "
+#                    f"positive_contexts[0]={self.positive_contexts[0].shape}, "
+#                    f"negative_context={self.negative_context.shape}, "
+#                    f"v_teacher={self.v_teacher.shape}")
         
-        # Validate shapes
-        self._validate_shapes()
+#         # Validate shapes
+#         self._validate_shapes()
 
-    def _validate_shapes(self):
-        """Validate tensor shapes to catch issues early"""
-        expected_sample_shape = (16, 1, 60, 104)
-        expected_context_shape = (512, 4096)
+#     def _validate_shapes(self):
+#         """Validate tensor shapes to catch issues early"""
+#         expected_sample_shape = (16, 1, 60, 104)
+#         expected_context_shape = (512, 4096)
         
-        # Check first sample shape (excluding batch dimension)
-        sample_shape = tuple(self.samples[0].shape)
-        if sample_shape != expected_sample_shape:
-            logger.warning(f"Sample shape mismatch: got {sample_shape}, expected {expected_sample_shape}")
+#         # Check first sample shape (excluding batch dimension)
+#         sample_shape = tuple(self.samples[0].shape)
+#         if sample_shape != expected_sample_shape:
+#             logger.warning(f"Sample shape mismatch: got {sample_shape}, expected {expected_sample_shape}")
         
-        # Check first positive context shape
-        context_shape = tuple(self.positive_contexts[0].shape)
-        if context_shape != expected_context_shape:
-            logger.warning(f"Positive context shape mismatch: got {context_shape}, expected {expected_context_shape}")
+#         # Check first positive context shape
+#         context_shape = tuple(self.positive_contexts[0].shape)
+#         if context_shape != expected_context_shape:
+#             logger.warning(f"Positive context shape mismatch: got {context_shape}, expected {expected_context_shape}")
         
-        # Check negative context shape
-        neg_context_shape = tuple(self.negative_context.shape)
-        if neg_context_shape != expected_context_shape:
-            logger.warning(f"Negative context shape mismatch: got {neg_context_shape}, expected {expected_context_shape}")
+#         # Check negative context shape
+#         neg_context_shape = tuple(self.negative_context.shape)
+#         if neg_context_shape != expected_context_shape:
+#             logger.warning(f"Negative context shape mismatch: got {neg_context_shape}, expected {expected_context_shape}")
 
-    def __len__(self):
-        """Return number of samples in dataset"""
-        return self.num_samples
+#     def __len__(self):
+#         """Return number of samples in dataset"""
+#         return self.num_samples
 
-    def __getitem__(self, idx):
-        """
-        Get a training example.
+#     def __getitem__(self, idx):
+#         """
+#         Get a training example.
         
-        Returns:
-            tuple: (noise, positive_context, negative_context, v_teacher)
-                - noise: Shape [16, 1, 60, 104] - The input noise
-                - positive_context: Shape [512, 4096] - Positive text embedding
-                - negative_context: Shape [512, 4096] - Negative text embedding
-                - v_teacher: Shape [16, 1, 60, 104] - Target prediction
-        """
-        # Get specific samples by index
-        noise = self.noise[idx]  # [16, 1, 60, 104]
-        v_teacher = self.v_teacher[idx]  # [16, 1, 60, 104]
-        positive_context = self.positive_contexts[idx]  # [512, 4096]
+#         Returns:
+#             tuple: (noise, positive_context, negative_context, v_teacher)
+#                 - noise: Shape [16, 1, 60, 104] - The input noise
+#                 - positive_context: Shape [512, 4096] - Positive text embedding
+#                 - negative_context: Shape [512, 4096] - Negative text embedding
+#                 - v_teacher: Shape [16, 1, 60, 104] - Target prediction
+#         """
+#         # Get specific samples by index
+#         noise = self.noise[idx]  # [16, 1, 60, 104]
+#         v_teacher = self.v_teacher[idx]  # [16, 1, 60, 104]
+#         positive_context = self.positive_contexts[idx]  # [512, 4096]
         
-        # Return tensors with correct shapes for model input
-        return noise, positive_context, self.negative_context, v_teacher
+#         # Return tensors with correct shapes for model input
+#         return noise, positive_context, self.negative_context, v_teacher
 
 def create_dataloader(data_path, batch_size=1):
     dataset = TextVideoDataset(data_path)
-    
-    # Custom collate function to handle potential shape variations
     def custom_collate(batch):
-        # Implement custom batching logic
-        noise = torch.stack([item[0] for item in batch])
-        pos_ctx = torch.stack([item[1] for item in batch])
-        neg_ctx = torch.stack([item[2] for item in batch])
-        v_teacher = torch.stack([item[3] for item in batch])
-        
-        return noise, pos_ctx, neg_ctx, v_teacher
+        noise = torch.stack([item[0] for item in batch])  # [B, 16, 1, 60, 104]
+        pos_ctx = torch.stack([item[1] for item in batch])  # [B, 512, 4096]
+        v_teacher = torch.stack([item[2] for item in batch])  # [B, 16, 1, 60, 104]
+        return noise, pos_ctx, v_teacher
     
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=custom_collate
-    )
-    
-    return dataloader, dataset
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate), dataset
 
 def test_dataset(data_path="dummy_data_480x832.pt"):
     """Test the TextVideoDataset and print sample shapes"""
@@ -381,16 +368,16 @@ def test_dataset(data_path="dummy_data_480x832.pt"):
         dataset = TextVideoDataset(data_path)
         logger.info(f"Successfully loaded dataset with {len(dataset)} samples")
         
-        # Test getting a single item
-        noise, pos_ctx, neg_ctx, v_teacher = dataset[0]
+        # Test getting a single item (3 items)
+        noise, pos_ctx, v_teacher = dataset[0]
         logger.info(f"Sample shapes: noise={noise.shape}, pos_ctx={pos_ctx.shape}, "
-                   f"neg_ctx={neg_ctx.shape}, v_teacher={v_teacher.shape}")
+                   f"v_teacher={v_teacher.shape}")
         
         # Test with dataloader
         dataloader, _ = create_dataloader(data_path, batch_size=2)
         batch = next(iter(dataloader))
         logger.info(f"Batch shapes: noise={batch[0].shape}, pos_ctx={batch[1].shape}, "
-                   f"neg_ctx={batch[2].shape}, v_teacher={batch[3].shape}")
+                   f"v_teacher={batch[2].shape}")
         
         return True
     except Exception as e:

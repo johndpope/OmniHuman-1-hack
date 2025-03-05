@@ -1,4 +1,4 @@
-from logger import logger,debug_memory 
+from logger import logger, debug_memory
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,20 +11,13 @@ from omegaconf import OmegaConf
 from accelerate import Accelerator
 
 from wan.modules.model import WanModel
-from wan.text2video import WanT2V
 from wan.utils.utils import str2bool
 import gc
-
 import sys
-# import os
-# os.environ["FORCE_COLOR"] = "true"
 
-
-torch.cuda.set_per_process_memory_fraction(0.8) 
-
+torch.cuda.set_per_process_memory_fraction(0.8)
 
 def train_consistency_distillation(
-    original_model,  # Unused but kept for compatibility
     config,
     train_dataloader,
     checkpoint_dir,
@@ -33,6 +26,7 @@ def train_consistency_distillation(
     accelerator,
     num_epochs=10,
     learning_rate=5e-6,
+    cfg_scale=7.5,
     save_interval=350,
     use_wandb=False,
     project_name="wan-consistency-distillation",
@@ -50,7 +44,8 @@ def train_consistency_distillation(
             "gradient_accumulation_steps": gradient_accumulation_steps
         })
 
-    distilled_model = WanModel.from_pretrained(checkpoint_dir)
+    # Load and prepare distilled model
+    distilled_model = WanModel.from_pretrained(checkpoint_dir, use_checkpoint=use_gradient_checkpointing)
     optimizer = optim.RMSprop(distilled_model.parameters(), lr=learning_rate, alpha=0.9)
     distilled_model, optimizer, train_dataloader = accelerator.prepare(distilled_model, optimizer, train_dataloader)
 
@@ -69,39 +64,43 @@ def train_consistency_distillation(
 
     for epoch in range(num_epochs):
         logger.debug(f"Starting epoch {epoch+1}/{num_epochs}")
+        debug_memory(f"Before epoch {epoch+1}")
         for batch_idx, batch in enumerate(tqdm(train_dataloader)):
-            noise, positive_contexts, negative_contexts, v_teacher = batch
+            noise, positive_contexts, v_teacher = batch
             logger.debug(f"Batch {batch_idx}: noise shape={noise.shape}, "
                          f"positive_contexts shape={positive_contexts.shape}, "
-                         f"negative_contexts shape={negative_contexts.shape}, "
                          f"v_teacher shape={v_teacher.shape}")
             debug_memory(f"After batch unpack - Batch {batch_idx}")
 
             with accelerator.accumulate(distilled_model):
-                noise = noise.to(device)
-                context = positive_contexts.to(device)
-                v_teacher = v_teacher.to(device)
-                debug_memory(f"After moving batch to device - Batch {batch_idx}")
+                noise = noise.to(device)  # [B, 16, 1, 60, 104]
+                context = positive_contexts.to(device)  # [B, 512, 4096]
+                v_teacher = v_teacher.to(device)  # [B, 16, 1, 60, 104]
+                debug_memory(f"After moving tensors to device - Batch {batch_idx}")
 
-                patch_size = distilled_model.patch_size
-                seq_len = (noise.shape[1] // patch_size[0]) * \
-                          (noise.shape[2] // patch_size[1]) * \
-                          (noise.shape[3] // patch_size[2])
+                patch_size = distilled_model.patch_size  # (1, 2, 2)
+                seq_len = (noise.shape[2] // patch_size[0]) * \
+                          (noise.shape[3] // patch_size[1]) * \
+                          (noise.shape[4] // patch_size[2])  # e.g., 1560
                 logger.debug(f"Computed seq_len for batch: {seq_len}")
 
                 timestep = torch.ones(noise.shape[0], device=device) * config.num_train_timesteps
                 logger.debug(f"Timestep shape: {timestep.shape}, value: {timestep[0].item()}")
 
+                # Student prediction
                 logger.debug("Running student model prediction")
-                v_student = distilled_model([noise], t=timestep, context=context, seq_len=seq_len)[0]
+                v_student_output = distilled_model(noise, t=timestep, context=context, seq_len=seq_len)
+                v_student = v_student_output[0]  # Extract the first element (prediction tensor)
                 logger.debug(f"Student prediction shape: {v_student.shape}")
-                debug_memory(f"After v_student prediction - Batch {batch_idx}")
+                debug_memory(f"After student prediction - Batch {batch_idx}")
 
+                # MSE loss
                 logger.debug("Calculating MSE loss")
                 loss = F.mse_loss(v_student, v_teacher)
                 logger.debug(f"Loss value: {loss.item()}")
                 debug_memory(f"After loss calculation - Batch {batch_idx}")
 
+                # Backpropagation
                 logger.debug("Starting backpropagation")
                 accelerator.backward(loss)
                 logger.debug("Completed backpropagation")
@@ -110,17 +109,18 @@ def train_consistency_distillation(
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
                     logger.debug("Updating optimizer")
                     optimizer.step()
-                    debug_memory(f"After optimizer.step() - Batch {batch_idx}")
                     optimizer.zero_grad()
+                    debug_memory(f"After optimizer step - Batch {batch_idx}")
+
                     logger.debug("Updating EMA model")
                     ema_model.to(device)
                     update_ema(ema_model, distilled_model, ema_decay)
                     ema_model.to('cpu')
-                    torch.cuda.empty_cache()
                     debug_memory(f"After EMA update - Batch {batch_idx}")
 
+                # Cleanup
                 logger.debug("Cleaning up GPU memory")
-                del v_student, noise, context, v_teacher
+                del v_student, v_student_output, noise, context, v_teacher
                 torch.cuda.empty_cache()
                 debug_memory(f"After cleanup - Batch {batch_idx}")
 
@@ -130,11 +130,7 @@ def train_consistency_distillation(
             if use_wandb and accelerator.is_main_process and batch_idx % 5 == 0:
                 wandb.log({"step": step, "batch_loss": loss.item(), "avg_loss": total_loss / (batch_idx + 1), "epoch": epoch + 1})
 
-            if accelerator.is_main_process and batch_idx % 10 == 0:
-                avg_loss = total_loss / (batch_idx + 1)
-                logger.debug(f"Progress update: Epoch {epoch+1}, Batch {batch_idx}, Avg Loss: {avg_loss:.6f}")
-
-            if step % save_interval == 0 and accelerator.is_main_process:
+            if accelerator.is_main_process and step % save_interval == 0:
                 checkpoint_path = f"{output_dir}/consistency_model_step_{step}.pt"
                 logger.debug(f"Saving checkpoint to {checkpoint_path}")
                 unwrapped_ema = accelerator.unwrap_model(ema_model)
@@ -162,21 +158,21 @@ def train_consistency_distillation(
         wandb.finish()
 
     return accelerator.unwrap_model(ema_model)
-# Adjusted Dataset and Main Section
+
+# Dataset (unchanged)
 class TextVideoDataset(torch.utils.data.Dataset):
     def __init__(self, data_path):
         data_dict = torch.load(data_path, map_location='cpu')
-        self.noise = data_dict['dummy_data']  # Precomputed noise
-        self.positive_contexts = data_dict['positive_contexts']
-        self.negative_context = data_dict['negative_context']
-        self.v_teacher = data_dict['v_teacher']  # Precomputed teacher outputs
+        self.noise = data_dict['noise']  # [100, 16, 1, 60, 104]
+        self.positive_contexts = data_dict['positive_contexts']  # List of [512, 4096]
+        self.v_teacher = data_dict['v_teacher']  # [100, 16, 1, 60, 104]
         self.num_samples = len(self.noise)
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        return self.noise[idx], self.positive_contexts[idx], self.negative_context, self.v_teacher[idx]
+        return self.noise[idx], self.positive_contexts[idx], self.v_teacher[idx]
 
 if __name__ == "__main__":
     import argparse
@@ -216,19 +212,7 @@ if __name__ == "__main__":
 
     config = t2v_1_3B
     if not hasattr(config, 'seq_len'):
-        config.seq_len = 512
-
-    # original_model = WanT2V(
-    #     config=config,
-    #     checkpoint_dir=args.checkpoint_dir,
-    #     device_id=args.device_id,
-    #     rank=0,
-    #     t5_fsdp=args.t5_fsdp,
-    #     dit_fsdp=args.dit_fsdp,
-    #     use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
-    #     t5_cpu=args.t5_cpu,
-    #     disable_load_t5=True # we already offloaded / precomputed in generate.py
-    # ).model.to(device)
+        config.seq_len = 1560  # Computed based on 480x832 resolution
 
     data_file = "dummy_data_480x832.pt"
     if not os.path.exists(data_file):
@@ -240,7 +224,6 @@ if __name__ == "__main__":
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=1, pin_memory=True)
 
     distilled_model = train_consistency_distillation(
-        original_model=None,  # Not needed
         config=config,
         train_dataloader=train_dataloader,
         checkpoint_dir=args.checkpoint_dir,
