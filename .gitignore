@@ -1,8 +1,13 @@
 
 *.pyc
+*.pt
+*.bin
+*.pkl
+*.safetensors
 project.log
 models/
 seaweed_apt/wandb/*
 seaweed_apt/dummy_data.pt
 seaweed_apt/dummy_prompts.pt
 seaweed_apt/dummy_data_480x832.pt
+seaweed_apt/checkpoint_epoch_5/random_states_0.pkl
