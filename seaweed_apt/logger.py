@@ -130,7 +130,33 @@ from rich.traceback import install
 # Enable rich tracebacks globally
 install()
 
+def log_gpu_memory_usage(tag):
+    """Log detailed GPU memory usage"""
+    if not torch.cuda.is_available():
+        return
+    
+    allocated = torch.cuda.memory_allocated() / (1024**3)
+    reserved = torch.cuda.memory_reserved() / (1024**3)
+    max_allocated = torch.cuda.max_memory_allocated() / (1024**3)
+    
+    logger.debug(f"Memory at {tag}: "
+                f"Current allocated: {allocated:.2f} GB, "
+                f"Reserved: {reserved:.2f} GB, "
+                f"Peak allocated: {max_allocated:.2f} GB")
+    
+    # Reset peak stats to track peak within sections
+    torch.cuda.reset_peak_memory_stats()
 
+def log_tensor_sizes(tensors_dict, tag):
+    """Log sizes of specific tensors"""
+    sizes_info = []
+    for name, tensor in tensors_dict.items():
+        if isinstance(tensor, torch.Tensor):
+            size_mb = tensor.element_size() * tensor.nelement() / (1024**2)
+            device = tensor.device
+            sizes_info.append(f"{name}: {tensor.shape}, {size_mb:.2f} MB on {device}")
+    
+    logger.debug(f"Tensor sizes at {tag}:\n" + "\n".join(sizes_info))
 
 
 def debug_memory(location="", show_tensors=False):

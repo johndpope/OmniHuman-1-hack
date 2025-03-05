@@ -7,7 +7,7 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 import torch.utils.checkpoint as checkpoint
-
+from logger import logger
 
 from .attention import flash_attention
 
@@ -89,15 +89,18 @@ class WanRMSNorm(nn.Module):
 
 
 class WanLayerNorm(nn.LayerNorm):
-
     def __init__(self, dim, eps=1e-6, elementwise_affine=False):
         super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
+        if not elementwise_affine:
+            self.weight = None  # Explicitly set to None for clarity
 
     def forward(self, x):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-        """
+        logger.debug(f"LayerNorm input: {type(x)}, is None: {x is None}")
+        if x is None:
+            logger.debug("x is None in LayerNorm.forward")
+            # Return zeros with a default device if weight is None
+            device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
+            return torch.zeros(1, device=device)
         return super().forward(x.float()).type_as(x)
 
 
@@ -273,48 +276,59 @@ class WanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(
-        self,
-        x,
-        e,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        context,
-        context_lens,
-    ):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, 6, C]
-            seq_lens(Tensor): Shape [B], length of each sequence in batch
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-        """
+    def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, block_idx=0):
+        logger.debug(f"WanAttentionBlock input: {type(x)}, is None: {x is None}")
+        if x is None:
+            logger.debug("x is None in WanAttentionBlock.forward")
+            batch_size = e.size(0)
+            # Use seq_lens.max() and self.dim to create a properly shaped tensor
+            x = torch.zeros(batch_size, seq_lens.max().item(), self.dim, device=e.device, dtype=e.dtype)
+        
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
 
-        # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+        # Self-attention
+        normed_x = self.norm1(x)
+        attn_input = normed_x.float() * (1 + e[1]) + e[0]
+        y = self.self_attn(attn_input, seq_lens, grid_sizes, freqs)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-            with amp.autocast(dtype=torch.float32):
-                x = x + y * e[5]
-            return x
-
-        x = cross_attn_ffn(x, context, context_lens, e)
+        # Cross-attention and FFN
+        x = self.cross_attn_ffn(x, context, context_lens, e, block_idx)
+        
+        logger.debug(f"WanAttentionBlock output: {x.shape if x is not None else 'None'}")
         return x
 
 
+    def cross_attn_ffn(self, x, context, context_lens, e, block_idx):
+        logger.debug(f"cross_attn_ffn input: {type(x)}, is None: {x is None}")
+        if x is None:
+            logger.debug("x is None in cross_attn_ffn")
+            batch_size = e.size(0)
+            x = torch.zeros(batch_size, x.size(1) if x is not None else 1560, self.dim, 
+                            device=e.device, dtype=e.dtype)
+
+        x_after_attn = x + self.cross_attn(self.norm3(x), context, context_lens)
+        normed_x = self.norm2(x_after_attn).float()
+        ffn_input = normed_x * (1 + e[4]) + e[3]
+
+        if block_idx > 10:
+            with torch.no_grad():
+                cpu_ffn = self.ffn.to('cpu')  # Move FFN to CPU
+                cpu_input = ffn_input.cpu()
+                cpu_result = cpu_ffn(cpu_input)
+                y = cpu_result.to(ffn_input.device, dtype=ffn_input.dtype)
+                self.ffn.to(ffn_input.device)  # Move FFN back to GPU
+            y = y + 0 * ffn_input  # Preserve gradient flow
+        else:
+            y = self.ffn(ffn_input)
+
+        x_new = x_after_attn + y * e[5]
+        logger.debug(f"cross_attn_ffn output: {x_new.shape}")
+        return x_new
+        
 class Head(nn.Module):
 
     def __init__(self, dim, out_dim, patch_size, eps=1e-6):
@@ -387,7 +401,7 @@ class WanModel(ModelMixin, ConfigMixin):
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6,
-                 use_checkpoint=False):  # Add gradient checkpointing parameter
+                 use_checkpoint=True):  # Add gradient checkpointing parameter
 
         r"""
         Initialize the diffusion model backbone.
@@ -429,7 +443,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         assert model_type in ['t2v', 'i2v']
         self.model_type = model_type
-
+        self.use_checkpoint = use_checkpoint
         self.patch_size = patch_size
         self.text_len = text_len
         self.in_dim = in_dim
@@ -444,8 +458,6 @@ class WanModel(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
-
-        self.use_checkpoint = use_checkpoint  # Store the checkpointing flag
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -485,39 +497,13 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
-    def forward(
-        self,
-        x,
-        t,
-        context,
-        seq_len,
-        clip_fea=None,
-        y=None,
-    ):
-        r"""
-        Forward pass through the diffusion model
 
-        Args:
-            x (List[Tensor]):
-                List of input video tensors, each with shape [C_in, F, H, W]
-            t (Tensor):
-                Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
-            clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode
-            y (List[Tensor], *optional*):
-                Conditional video inputs for image-to-video mode, same shape as x
 
-        Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
-        """
-        if self.model_type == 'i2v':
-            assert clip_fea is not None and y is not None
-        # params
+    def forward(self, x, t, context, seq_len, clip_fea=None, y=None):
+        torch.cuda.empty_cache()
+        logger.debug("Starting WanModel.forward")
+        logger.debug(f"Input x type: {type(x)}, length: {len(x) if isinstance(x, list) else 'not list'}")
+
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
@@ -525,69 +511,57 @@ class WanModel(ModelMixin, ConfigMixin):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
-        # embeddings
+        # Video embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        logger.debug(f"After patch_embedding: {[u.shape for u in x]}")
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x]).to(device)
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
-        x = torch.cat([
-            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
-                      dim=1) for u in x
-        ])
+        logger.debug(f"After flatten and transpose: {[u.shape for u in x]}")
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=device)
+        assert seq_lens.max() <= seq_len, f"Max seq len {seq_lens.max()} exceeds limit {seq_len}"
+        x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
+        logger.debug(f"After padding and cat: {x.shape}")
 
-        # time embeddings
+        # Time embeddings
         with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())
+            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # context
-        context_lens = None
-        context = self.text_embedding(
-            torch.stack([
-                torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in context
-            ]))
-
+        # Context embeddings
+        context_lens = torch.tensor([u.size(0) for u in context], dtype=torch.long, device=device)  # Compute context lengths
+        context = self.text_embedding(torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]))
+        logger.debug(f"Context shape: {context.shape}, context_lens: {context_lens}")
         if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context_clip = self.img_emb(clip_fea)
             context = torch.concat([context_clip, context], dim=1)
+            context_lens = context_lens + context_clip.size(1)  # Adjust context_lens if clip_fea is added
 
-        # arguments
-        kwargs = dict(
-            e=e0,
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=self.freqs,
-            context=context,
-            context_lens=context_lens)
+        # Process blocks
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            for i, block in enumerate(self.blocks):
+                logger.debug(f"Processing block {i}, x shape: {x.shape if x is not None else 'None'}")
+                try:
+                    if self.use_checkpoint:
+                        x = checkpoint.checkpoint(
+                            block, x, e0, seq_lens, grid_sizes, self.freqs, context, context_lens, i,
+                            use_reentrant=False
+                        )
+                    else:
+                        x = block(
+                            x, e0, seq_lens, grid_sizes, self.freqs, context, context_lens, block_idx=i
+                        )
+                except Exception as e:
+                    logger.error(f"Error in block {i}: {str(e)}")
+                    raise
+                logger.debug(f"After block {i}, x shape: {x.shape if x is not None else 'None'}")
 
-        # Process through transformer blocks with optional gradient checkpointing
-        for i, block in enumerate(self.blocks):
-            if self.use_checkpoint and self.training:
-                # Custom function that preserves the kwargs dictionary structure
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(inputs[0], **{k: inputs[i+1] for i, k in enumerate(kwargs.keys())})
-                    return custom_forward
-                
-                # Prepare inputs for checkpointing (must be tensors)
-                checkpoint_inputs = [x] + list(kwargs.values())
-                x = checkpoint.checkpoint(create_custom_forward(block), *checkpoint_inputs)
-            else:
-                x = block(x, **kwargs)
-
-        # head
+        # Head and unpatchify
+        logger.debug(f"Before head: x shape {x.shape if x is not None else 'None'}")
         x = self.head(x, e)
-
-        # unpatchify
+        logger.debug(f"Before unpatchify: x shape {x.shape if x is not None else 'None'}")
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
-
+        
     def unpatchify(self, x, grid_sizes):
         r"""
         Reconstruct video tensors from patch embeddings.

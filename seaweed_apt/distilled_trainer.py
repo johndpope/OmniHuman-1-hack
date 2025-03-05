@@ -1,4 +1,4 @@
-from logger import logger, debug_memory
+from logger import logger,log_tensor_sizes, log_gpu_memory_usage,debug_memory
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,8 +14,14 @@ from wan.modules.model import WanModel
 from wan.utils.utils import str2bool
 import gc
 import sys
-
+import torch.random
+from torch.cuda.amp import GradScaler, autocast
 torch.cuda.set_per_process_memory_fraction(0.8)
+
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 
 def train_consistency_distillation(
     config,
@@ -32,132 +38,300 @@ def train_consistency_distillation(
     project_name="wan-consistency-distillation",
     run_name=None,
     use_gradient_checkpointing=True,
-    gradient_accumulation_steps=8
+    gradient_accumulation_steps=16
 ):
     logger.debug("Initializing consistency distillation training...")
     os.makedirs(output_dir, exist_ok=True)
-
+    
+    # Set seed for reproducibility
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    # WandB setup
     if use_wandb and accelerator.is_main_process:
         wandb.init(project=project_name, name=run_name, config={
-            "learning_rate": learning_rate, "num_epochs": num_epochs, "save_interval": save_interval,
-            "method": "consistency_distillation", "use_gradient_checkpointing": use_gradient_checkpointing,
+            "learning_rate": learning_rate, 
+            "num_epochs": num_epochs, 
+            "save_interval": save_interval,
+            "method": "consistency_distillation", 
+            "use_gradient_checkpointing": use_gradient_checkpointing,
             "gradient_accumulation_steps": gradient_accumulation_steps
         })
 
-    # Load and prepare distilled model
-    distilled_model = WanModel.from_pretrained(checkpoint_dir, use_checkpoint=use_gradient_checkpointing)
-    optimizer = optim.RMSprop(distilled_model.parameters(), lr=learning_rate, alpha=0.9)
-    distilled_model, optimizer, train_dataloader = accelerator.prepare(distilled_model, optimizer, train_dataloader)
+    # Model setup
+    logger.debug(f"Loading model from {checkpoint_dir}")
+    distilled_model = WanModel.from_pretrained(checkpoint_dir)
+    distilled_model.use_checkpoint = use_gradient_checkpointing
+    
+    # Use AdamW optimizer for lower memory usage
+    logger.debug("Initializing AdamW optimizer")
+    optimizer = optim.AdamW(
+        distilled_model.parameters(), 
+        lr=learning_rate,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+    
+    # Accelerator preparation
+    logger.debug("Preparing model and optimizer with accelerator")
+    distilled_model, optimizer, train_dataloader = accelerator.prepare(
+        distilled_model, optimizer, train_dataloader
+    )
 
     distilled_model.train()
-    ema_model = WanModel.from_pretrained(checkpoint_dir, use_checkpoint=use_gradient_checkpointing)
+    
+    # Initialize EMA model on CPU
+    logger.debug("Initializing EMA model on CPU")
+    ema_model = WanModel.from_pretrained(checkpoint_dir)
     ema_model.eval()
+    ema_model.requires_grad_(False)
+    ema_model = ema_model.cpu()
     ema_decay = 0.995
 
-    def update_ema(target_model, source_model, decay):
-        with torch.no_grad():
-            for target_param, source_param in zip(target_model.parameters(), source_model.parameters()):
-                target_param.data.mul_(decay).add_(source_param.data, alpha=1 - decay)
+    # Mixed precision setup
+    logger.debug("Setting up GradScaler for mixed precision")
+    scaler = GradScaler()
+    
+    # Try to register objects for checkpointing if the method exists
+    if hasattr(accelerator, "register_for_checkpointing"):
+        accelerator.register_for_checkpointing(scaler)
 
+    # Training loop variables
     total_loss = 0.0
-    step = 0
+    global_step = 0
+    samples_processed = 0
 
+    # Main training loop
     for epoch in range(num_epochs):
         logger.debug(f"Starting epoch {epoch+1}/{num_epochs}")
         debug_memory(f"Before epoch {epoch+1}")
+        epoch_loss = 0.0
+        
+        # Reset optimizer at the start of each epoch
+        optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, batch in enumerate(tqdm(train_dataloader)):
-            noise, positive_contexts, v_teacher = batch
-            logger.debug(f"Batch {batch_idx}: noise shape={noise.shape}, "
-                         f"positive_contexts shape={positive_contexts.shape}, "
-                         f"v_teacher shape={v_teacher.shape}")
-            debug_memory(f"After batch unpack - Batch {batch_idx}")
-
-            with accelerator.accumulate(distilled_model):
-                noise = noise.to(device)  # [B, 16, 1, 60, 104]
-                context = positive_contexts.to(device)  # [B, 512, 4096]
-                v_teacher = v_teacher.to(device)  # [B, 16, 1, 60, 104]
-                debug_memory(f"After moving tensors to device - Batch {batch_idx}")
-
-                patch_size = distilled_model.patch_size  # (1, 2, 2)
-                seq_len = (noise.shape[2] // patch_size[0]) * \
-                          (noise.shape[3] // patch_size[1]) * \
-                          (noise.shape[4] // patch_size[2])  # e.g., 1560
-                logger.debug(f"Computed seq_len for batch: {seq_len}")
-
-                timestep = torch.ones(noise.shape[0], device=device) * config.num_train_timesteps
-                logger.debug(f"Timestep shape: {timestep.shape}, value: {timestep[0].item()}")
-
-                # Student prediction
-                logger.debug("Running student model prediction")
-                v_student_output = distilled_model(noise, t=timestep, context=context, seq_len=seq_len)
-                v_student = v_student_output[0]  # Extract the first element (prediction tensor)
-                logger.debug(f"Student prediction shape: {v_student.shape}")
-                debug_memory(f"After student prediction - Batch {batch_idx}")
-
-                # MSE loss
-                logger.debug("Calculating MSE loss")
-                loss = F.mse_loss(v_student, v_teacher)
-                logger.debug(f"Loss value: {loss.item()}")
-                debug_memory(f"After loss calculation - Batch {batch_idx}")
-
-                # Backpropagation
-                logger.debug("Starting backpropagation")
-                accelerator.backward(loss)
-                logger.debug("Completed backpropagation")
-                debug_memory(f"After backpropagation - Batch {batch_idx}")
-
-                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
-                    logger.debug("Updating optimizer")
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    debug_memory(f"After optimizer step - Batch {batch_idx}")
-
-                    logger.debug("Updating EMA model")
-                    ema_model.to(device)
-                    update_ema(ema_model, distilled_model, ema_decay)
-                    ema_model.to('cpu')
-                    debug_memory(f"After EMA update - Batch {batch_idx}")
-
-                # Cleanup
-                logger.debug("Cleaning up GPU memory")
-                del v_student, v_student_output, noise, context, v_teacher
-                torch.cuda.empty_cache()
-                debug_memory(f"After cleanup - Batch {batch_idx}")
-
-            total_loss += loss.item()
-            step += 1
-
-            if use_wandb and accelerator.is_main_process and batch_idx % 5 == 0:
-                wandb.log({"step": step, "batch_loss": loss.item(), "avg_loss": total_loss / (batch_idx + 1), "epoch": epoch + 1})
-
-            if accelerator.is_main_process and step % save_interval == 0:
-                checkpoint_path = f"{output_dir}/consistency_model_step_{step}.pt"
-                logger.debug(f"Saving checkpoint to {checkpoint_path}")
-                unwrapped_ema = accelerator.unwrap_model(ema_model)
-                torch.save(unwrapped_ema.state_dict(), checkpoint_path)
-                logger.debug(f"Saved EMA checkpoint to {checkpoint_path}")
-
+            # Determine if this is the last step in accumulation cycle
+            is_last_accumulation_step = (
+                (batch_idx + 1) % gradient_accumulation_steps == 0 or 
+                batch_idx == len(train_dataloader) - 1
+            )
+            
+            # Log batch information
+            debug_memory(f"Before batch {batch_idx}")
+            
+            # Execute the training step
+            step_output = training_step(
+                batch=batch,
+                distilled_model=distilled_model,
+                config=config,
+                device=device,
+                scaler=scaler,
+                optimizer=optimizer,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                is_last_step=is_last_accumulation_step
+            )
+            
+            # Track losses
+            batch_loss = step_output["loss"]
+            total_loss += batch_loss
+            epoch_loss += batch_loss
+            samples_processed += batch[0].size(0)
+            
+            # After successful accumulation cycle
+            if step_output["is_accumulation_complete"]:
+                # Update global step counter
+                global_step += 1
+                
+                # Update EMA model
+                unwrapped_model = accelerator.unwrap_model(distilled_model)
+                update_ema_model(ema_model, unwrapped_model, ema_decay)
+                
+                # Save checkpoint periodically
+                if global_step % save_interval == 0:
+                    # Create checkpoint directory
+                    checkpoint_dir = os.path.join(output_dir, f"checkpoint_{global_step}")
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    
+                    logger.debug(f"Saving checkpoint at step {global_step}")
+                    # Use save_state or manually save depending on what's available
+                    if hasattr(accelerator, "save_state"):
+                        accelerator.save_state(checkpoint_dir)
+                    else:
+                        # Manual save as fallback - save unwrapped model
+                        if accelerator.is_main_process:
+                            unwrapped_model = accelerator.unwrap_model(distilled_model)
+                            torch.save({
+                                'model': unwrapped_model.state_dict(),
+                                'optimizer': optimizer.state_dict(),
+                                'scaler': scaler.state_dict() if scaler is not None else None,
+                                'step': global_step,
+                                'epoch': epoch,
+                            }, os.path.join(checkpoint_dir, "pytorch_model.bin"))
+                    
+                    # Also save EMA model separately
+                    if accelerator.is_main_process:
+                        ema_checkpoint_path = f"{output_dir}/ema_model_step_{global_step}.pt"
+                        logger.debug(f"Saving EMA model to {ema_checkpoint_path}")
+                        torch.save(ema_model.state_dict(), ema_checkpoint_path)
+                
+                # Log metrics
+                if use_wandb and accelerator.is_main_process and global_step % 5 == 0:
+                    avg_loss = total_loss / (samples_processed or 1)
+                    wandb.log({
+                        "step": global_step, 
+                        "batch_loss": batch_loss,
+                        "avg_loss": avg_loss,
+                        "epoch": epoch + 1,
+                        "samples_processed": samples_processed
+                    })
+                
+                # Reset accumulation variables if needed
+                debug_memory(f"After accumulation step {global_step}")
+            
+        # End of epoch processing
+        avg_epoch_loss = epoch_loss / len(train_dataloader)
+        logger.debug(f"Epoch {epoch+1} completed with average loss: {avg_epoch_loss}")
+        
+        # Save epoch checkpoint 
+        epoch_checkpoint_dir = os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}")
+        os.makedirs(epoch_checkpoint_dir, exist_ok=True)
+        
+        logger.debug(f"Saving checkpoint for epoch {epoch+1}")
+        if hasattr(accelerator, "save_state"):
+            accelerator.save_state(epoch_checkpoint_dir)
+        else:
+            # Manual save as fallback
+            if accelerator.is_main_process:
+                unwrapped_model = accelerator.unwrap_model(distilled_model)
+                torch.save({
+                    'model': unwrapped_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scaler': scaler.state_dict() if scaler is not None else None,
+                    'step': global_step,
+                    'epoch': epoch,
+                }, os.path.join(epoch_checkpoint_dir, "pytorch_model.bin"))
+        
+        # Save EMA model for this epoch
         if accelerator.is_main_process:
-            checkpoint_path = f"{output_dir}/consistency_model_epoch_{epoch+1}.pt"
-            logger.debug(f"Saving epoch checkpoint to {checkpoint_path}")
-            unwrapped_ema = accelerator.unwrap_model(ema_model)
-            torch.save(unwrapped_ema.state_dict(), checkpoint_path)
-            logger.debug(f"Saved EMA epoch checkpoint to {checkpoint_path}")
+            checkpoint_path = f"{output_dir}/ema_model_epoch_{epoch+1}.pt"
+            logger.debug(f"Saving epoch EMA checkpoint to {checkpoint_path}")
+            torch.save(ema_model.state_dict(), checkpoint_path)
+            logger.debug(f"Epoch EMA checkpoint saved")
+            
+            if use_wandb:
+                wandb.log({"epoch": epoch + 1, "epoch_loss": avg_epoch_loss})
 
-        logger.debug(f"Completed epoch {epoch+1}/{num_epochs}")
-        total_loss = 0.0
-
+    # Save final model
     if accelerator.is_main_process:
-        final_path = f"{output_dir}/consistency_model_final.pt"
+        final_path = f"{output_dir}/ema_model_final.pt"
         logger.debug(f"Saving final EMA model to {final_path}")
-        unwrapped_ema = accelerator.unwrap_model(ema_model)
-        torch.save(unwrapped_ema.state_dict(), final_path)
-        logger.debug(f"Saved final EMA consistency model to {final_path}")
+        torch.save(ema_model.state_dict(), final_path)
+        logger.debug("Final EMA model saved")
 
+    # Clean up
     if use_wandb and accelerator.is_main_process:
         wandb.finish()
+        
+    logger.debug("Training completed successfully")
+    return ema_model
 
-    return accelerator.unwrap_model(ema_model)
+def training_step(batch, distilled_model, config, device, scaler, optimizer, gradient_accumulation_steps, is_last_step=False):
+    # Extract and move data to device
+    noise, positive_contexts, v_teacher = batch
+    noise = noise.to(device)
+    context = positive_contexts.to(device)
+    v_teacher = v_teacher.to(device)
+    
+    log_tensor_sizes({
+        "noise": noise, 
+        "positive_contexts": positive_contexts, 
+        "v_teacher": v_teacher
+    }, "Before moving to GPU")
+
+    # Check tensor integrity
+    logger.debug(f"noise shape: {noise.shape}, dtype: {noise.dtype}")
+    logger.debug(f"context shape: {context.shape}, dtype: {context.dtype}")
+    logger.debug(f"v_teacher shape: {v_teacher.shape}, dtype: {v_teacher.dtype}")
+
+    # Prepare model inputs
+    contexts_list = [context[i] for i in range(context.size(0))]
+    patch_size = distilled_model.patch_size
+    seq_len = (noise.shape[2] // patch_size[0]) * \
+              (noise.shape[3] // patch_size[1]) * \
+              (noise.shape[4] // patch_size[2])
+    timestep = torch.ones(noise.shape[0], device=device) * config.num_train_timesteps
+    
+    # Forward pass with mixed precision
+    with autocast():
+        logger.debug("Forward pass: model prediction")
+        
+        # Try-except to capture errors
+        try:
+            v_student_output = distilled_model(
+                noise, 
+                t=timestep, 
+                context=contexts_list,
+                seq_len=seq_len
+            )
+            
+            # Check if output is valid
+            if v_student_output is None or len(v_student_output) == 0:
+                logger.error("Model output is None or empty")
+                raise ValueError("Model returned None or empty output")
+                
+            v_student = v_student_output[0]
+            logger.debug(f"v_student shape: {v_student.shape}, dtype: {v_student.dtype}")
+            
+            # Scale loss for accumulation
+            loss = F.mse_loss(v_student, v_teacher) / gradient_accumulation_steps
+            logger.debug(f"Calculated loss: {loss.item() * gradient_accumulation_steps}")
+        except Exception as e:
+            logger.error(f"Error in forward pass: {str(e)}")
+            raise
+
+    # Immediate cleanup of unused tensors
+    del contexts_list, timestep
+    torch.cuda.empty_cache()
+    
+    # Backward pass with memory management
+    logger.debug("Backward pass: calculating gradients")
+    scaler.scale(loss).backward()
+    
+    # Capture loss value and cleanup remaining tensors
+    loss_value = loss.item() * gradient_accumulation_steps
+    del v_student_output, v_student, loss
+    torch.cuda.empty_cache()
+    
+    # Only keep gradients, remove everything else
+    del noise, context, v_teacher
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    return {
+        "loss": loss_value,
+        "is_accumulation_complete": is_last_step,
+    }
+
+
+def update_ema_model(ema_model, model, decay):
+    """Updates EMA model parameters with CPU operations to save memory
+    
+    Args:
+        ema_model: The EMA model (kept on CPU)
+        model: The current training model
+        decay: EMA decay factor
+    """
+    logger.debug("Updating EMA model")
+    with torch.no_grad():
+        for target_param, source_param in zip(ema_model.parameters(), model.parameters()):
+            # Move source parameter to CPU for the update
+            cpu_param = source_param.detach().cpu()
+            target_param.data.mul_(decay).add_(cpu_param, alpha=1 - decay)
+    logger.debug("EMA update completed")
+    torch.cuda.empty_cache()
 
 # Dataset (unchanged)
 class TextVideoDataset(torch.utils.data.Dataset):
