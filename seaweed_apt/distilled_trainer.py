@@ -339,7 +339,8 @@ if __name__ == "__main__":
         t5_fsdp=args.t5_fsdp,
         dit_fsdp=args.dit_fsdp,
         use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
-        t5_cpu=args.t5_cpu
+        t5_cpu=args.t5_cpu,
+        disable_load_t5=True # we already offloaded / precomputed in generate.py
     ).model.to(device)
 
     # Check for generated data file with precomputed contexts
