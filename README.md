@@ -23,16 +23,16 @@ https://wandb.ai/snoozie/seaweed-apt-distillation
 **DRAFTED - Stage 1 of 2** (✅ - doing a training pass on 24gb gpu)
 - Implementation: [distilled_trainer.py](https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/distilled_trainer.py)
 
+
+
 ./generate.sh will prepare training data for WAN portrait video - 
 SIZE_CONFIGS["480*832"] 
 there's a vae_stride = (4, 8, 8) -> so the tensors become 60, 104
 the 16 is the feature channels. 
-```shell
+```python
 num_samples = 100 # need to check this - duration of video frames
 v_teacher = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)  # Velocity field
-```
 
-```json
  data_dict = {
         "dummy_data": dummy_data,
         "noise": noise, # [16, 1, 60, 104]
@@ -58,7 +58,7 @@ cd seaweed_apt
 - Implementation: [apt_trainer.py](https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/apt_trainer.py)
 
 ### TODO
-- Datasets / dataloaders - in progress
+- Train 9000 + samples for 350 epochs across 100+ GPUS
 
 
 
