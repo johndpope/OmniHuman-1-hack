@@ -17,6 +17,7 @@ import wan
 from wan.configs import WAN_CONFIGS
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_video, str2bool
+import argparse
 
 # Example prompt for fallback
 EXAMPLE_PROMPT = {
@@ -137,34 +138,28 @@ RANDOM_PROMPTS = [
     "A whimsical train journey through a land of candy",
 ]
 
-def generate_batch(config, num_samples=100, preprocess_text=True):
+def generate_batch(config, args,num_samples=100):
     rank = 0
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logger.debug(f"Using device: {device}")
 
     if not hasattr(config, 'text_len'):
         config.text_len = 512
-        logger.warning("Config missing 'text_len'. Defaulting to 512.")
 
     task = config.task if hasattr(config, 'task') else "t2v-14B"
     cfg = WAN_CONFIGS[task]
     ckpt_dir = config.ckpt_dir if hasattr(config, 'ckpt_dir') else "/path/to/checkpoints"
-    logger.debug(f"Task: {task}, Checkpoint dir: {ckpt_dir}")
-
-    logger.info("Creating WanT2V pipeline.")
+ # Initialize full WanT2V object
     wan_t2v = wan.WanT2V(
-        config=cfg,
-        checkpoint_dir=ckpt_dir,
+        config=config,
+        checkpoint_dir=args.checkpoint_dir,
         device_id=0,
         rank=rank,
-        t5_fsdp=False,
-        dit_fsdp=False,
-        use_usp=False,
-        t5_cpu=False,
+        t5_fsdp=args.t5_fsdp,
+        dit_fsdp=args.dit_fsdp,
+        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+        t5_cpu=args.t5_cpu
     )
-
-    logger.debug("Moving text encoder to GPU")
-    wan_t2v.text_encoder.model.to(device)
 
     dummy_prompts = RANDOM_PROMPTS[:num_samples]
     base_seed = random.randint(0, sys.maxsize) if not hasattr(config, 'base_seed') else config.base_seed
@@ -181,53 +176,57 @@ def generate_batch(config, num_samples=100, preprocess_text=True):
               (target_shape[2] // patch_size[1]) * \
               (target_shape[3] // patch_size[2])
     logger.info(f"Computed seq_len: {seq_len}")
+    # Precompute contexts
+    wan_t2v.text_encoder.model.to(device)
+    positive_contexts = [wan_t2v.text_encoder([prompt], device)[0].to(torch.float32).cpu() for prompt in dummy_prompts]
+    negative_context = wan_t2v.text_encoder([config.sample_neg_prompt], device)[0].to(torch.float32).cpu()
+    wan_t2v.text_encoder.model.cpu()
 
-    # Preprocess text contexts with padding to fixed length
-    logger.info("Preprocessing text contexts...")
-    positive_contexts = []
-    max_seq_len = config.text_len  # 512 by default
-    for i, prompt in enumerate(dummy_prompts):
-        logger.info(f"Processing prompt {i+1}/{num_samples}: {prompt}")
-        # Use tokenizer with padding to max_seq_len
-        ids, mask = wan_t2v.text_encoder.tokenizer([prompt], return_mask=True, padding='max_length', max_length=max_seq_len, truncation=True)
-        context = wan_t2v.text_encoder.model(ids.to(device), mask.to(device))
-        context = context[0].to(torch.float32).cpu()  # Shape: [max_seq_len, dim]
-        positive_contexts.append(context)
-        torch.cuda.empty_cache()
-
-    logger.info(f"Processing negative prompt: {config.sample_neg_prompt}")
-    # Process negative prompt with padding to max_seq_len
-    neg_ids, neg_mask = wan_t2v.text_encoder.tokenizer([config.sample_neg_prompt], return_mask=True, padding='max_length', max_length=max_seq_len, truncation=True)
-    context_null = wan_t2v.text_encoder.model(neg_ids.to(device), neg_mask.to(device))
-    negative_context = context_null[0].to(torch.float32).cpu()  # Shape: [max_seq_len, dim]
-
-    # Generate latents
-    logger.debug("Moving WanModel to GPU")
+    # Generate noise, dummy_data (latents), and v_teacher
+    logger.info("Generating noise, latents, and teacher predictions...")
     wan_t2v.model.to(device)
-    dummy_data_list = []
-    for i, prompt in enumerate(dummy_prompts):
+    noise_list = []
+    dummy_data_list = []  # Latents from teacher (restored)
+    v_teacher_list = []
+    timestep = torch.tensor([wan_t2v.num_train_timesteps - 1], device=device, dtype=torch.float32)
+    cfg_scale = 7.5  # Match training CFG scale
+
+    for i in range(num_samples):
         seed = base_seed + i
-        logger.info(f"Generating sample {i+1}/{num_samples} with prompt: {prompt}")
+        seed_g = torch.Generator(device=device)
+        seed_g.manual_seed(seed)
+        noise = torch.randn(1, *target_shape, dtype=torch.float32, device=device, generator=seed_g)
+        noise_list.append(noise.cpu())
+
         with torch.no_grad():
-            seed_g = torch.Generator(device=device)
-            seed_g.manual_seed(seed)
-            noise = torch.randn(1, *target_shape, dtype=torch.float32, device=device, generator=seed_g)
             context = positive_contexts[i].to(device)
             context_null = negative_context.to(device)
-            timestep = torch.tensor([wan_t2v.num_train_timesteps - 1], device=device, dtype=torch.float32)
-            noise_list = [noise[0]]
-            noise_pred_cond = wan_t2v.model(noise_list, t=timestep, context=[context], seq_len=seq_len)[0]
-            noise_pred_uncond = wan_t2v.model(noise_list, t=timestep, context=[context_null], seq_len=seq_len)[0]
-            latent = noise_pred_uncond + 7.5 * (noise_pred_cond - noise_pred_uncond)
-            dummy_data_list.append(latent.cpu())
-    dummy_data = torch.stack(dummy_data_list, dim=0)
-
-    # Clean up
-    wan_t2v.text_encoder.model.cpu()
+            noise_input = [noise[0]]
+            noise_pred_cond = wan_t2v.model(noise_input, t=timestep, context=[context], seq_len=seq_len)[0]
+            noise_pred_uncond = wan_t2v.model(noise_input, t=timestep, context=[context_null], seq_len=seq_len)[0]
+            latent = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+            dummy_data_list.append(latent.cpu())  # dummy_data as latents
+            v_teacher_list.append(latent.cpu())   # v_teacher identical to latents
+        torch.cuda.empty_cache()
     wan_t2v.model.cpu()
     torch.cuda.empty_cache()
 
-    return dummy_data, dummy_prompts, positive_contexts, negative_context
+    # Compile data dictionary
+    dummy_data = torch.stack(dummy_data_list, dim=0)  # Shape: [100, 16, 1, 60, 104]
+    noise = torch.stack(noise_list, dim=0)            # Shape: [100, 16, 1, 60, 104]
+    data_dict = {
+        "dummy_data": dummy_data,
+        "noise": noise,  # Added for student model input
+        "dummy_prompts": dummy_prompts,
+        "positive_contexts": positive_contexts,
+        "negative_context": negative_context,
+        "v_teacher": torch.stack(v_teacher_list, dim=0)  # Shape: [100, 16, 1, 60, 104]
+    }
+    filename = f"dummy_data_{size[0]}x{size[1]}.pt"
+    torch.save(data_dict, filename)
+    logger.info(f"Generated and saved data_dict to {filename} with keys: {data_dict.keys()}")
+
+    return data_dict
 
 
 # Adjusted Dataset for Testing
@@ -306,29 +305,28 @@ def test_text_video_dataset():
 # [INFO] Saved dummy_data shape: torch.Size([1, 16, 1, 60, 104]), dtype: torch.float32
 if __name__ == "__main__":
     # Load OmegaConf configuration
-    config = OmegaConf.load("config.yaml")  # Path to your config file
-    
-    # # Generate data with 10 samples (modify as needed)
-    dummy_data, dummy_prompts, positive_contexts, negative_context = generate_batch(config, num_samples=100) # We use 128∼256 H100 GPUs with gradient accumulation to reach a batch size of 9062.
-    
-    # # Define the size explicitly based on what was used (480*832)
-    size_str = "480x832"  
-    
-    # # Create a dictionary to save all data
-    data_dict = {
-        "dummy_data": dummy_data,
-        "dummy_prompts": dummy_prompts,
-        "positive_contexts": positive_contexts,
-        "negative_context": negative_context
-    }
-    
-    # Save with size in the filename
-    filename = f"dummy_data_{size_str}.pt"
-    torch.save(data_dict, filename)
-    logger.info(f"Generated and saved data_dict to {filename} with keys: {data_dict.keys()}")
-    
 
-    test_text_video_dataset()
-    # Optionally save prompts separately if needed
-    # torch.save(dummy_prompts, f"dummy_prompts_{size_str}.pt")
-    # logger.info(f"Saved dummy_prompts to dummy_prompts_{size_str}.pt")
+    parser = argparse.ArgumentParser(description="Train consistency distillation for Seaweed-APT")
+    parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to Wan T2V model checkpoints")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Output directory for checkpoints")
+    parser.add_argument("--device_id", type=int, default=0, help="CUDA device ID")
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate (paper: 5e-6)")
+    parser.add_argument("--cfg_scale", type=float, default=7.5, help="CFG scale (paper: 7.5)")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--use_wandb", type=str2bool, default=True, help="Use Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="seaweed-apt-distillation", help="WandB project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
+    parser.add_argument("--config_file", type=str, default="./config.yaml", help="Path to config file")
+    parser.add_argument("--save_interval", type=int, default=350, help="Save interval (paper: 350 updates)")
+    parser.add_argument("--t5_cpu", action="store_true", default=False, help="Whether to place T5 model on CPU.")
+    parser.add_argument("--dit_fsdp", action="store_true", default=False, help="Whether to use FSDP for DiT.")
+    parser.add_argument("--ulysses_size", type=int, default=1, help="The size of the ulysses parallelism in DiT.")
+    parser.add_argument("--ring_size", type=int, default=1, help="The size of the ring attention parallelism in DiT.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Steps for gradient accumulation")
+    parser.add_argument("--t5_fsdp", action="store_true", default=False, help="Whether to use FSDP for T5.")
+    args = parser.parse_args()
+    
+    from wan.configs import t2v_14B, t2v_1_3B
+    data_dict = generate_batch(t2v_1_3B, args,num_samples=100)
+    
