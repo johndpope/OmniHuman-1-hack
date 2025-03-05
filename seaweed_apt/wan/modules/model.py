@@ -95,9 +95,9 @@ class WanLayerNorm(nn.LayerNorm):
             self.weight = None  # Explicitly set to None for clarity
 
     def forward(self, x):
-        logger.debug(f"LayerNorm input: {type(x)}, is None: {x is None}")
+        # logger.debug(f"LayerNorm input: {type(x)}, is None: {x is None}")
         if x is None:
-            logger.debug("x is None in LayerNorm.forward")
+            # logger.debug("x is None in LayerNorm.forward")
             # Return zeros with a default device if weight is None
             device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
             return torch.zeros(1, device=device)
@@ -277,9 +277,9 @@ class WanAttentionBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, block_idx=0):
-        logger.debug(f"WanAttentionBlock input: {type(x)}, is None: {x is None}")
+        #logger.debug(f"WanAttentionBlock input: {type(x)}, is None: {x is None}")
         if x is None:
-            logger.debug("x is None in WanAttentionBlock.forward")
+            #logger.debug("x is None in WanAttentionBlock.forward")
             batch_size = e.size(0)
             # Use seq_lens.max() and self.dim to create a properly shaped tensor
             x = torch.zeros(batch_size, seq_lens.max().item(), self.dim, device=e.device, dtype=e.dtype)
@@ -298,14 +298,14 @@ class WanAttentionBlock(nn.Module):
         # Cross-attention and FFN
         x = self.cross_attn_ffn(x, context, context_lens, e, block_idx)
         
-        logger.debug(f"WanAttentionBlock output: {x.shape if x is not None else 'None'}")
+        #logger.debug(f"WanAttentionBlock output: {x.shape if x is not None else 'None'}")
         return x
 
 
     def cross_attn_ffn(self, x, context, context_lens, e, block_idx):
-        logger.debug(f"cross_attn_ffn input: {type(x)}, is None: {x is None}")
+        # logger.debug(f"cross_attn_ffn input: {type(x)}, is None: {x is None}")
         if x is None:
-            logger.debug("x is None in cross_attn_ffn")
+            # logger.debug("x is None in cross_attn_ffn")
             batch_size = e.size(0)
             x = torch.zeros(batch_size, x.size(1) if x is not None else 1560, self.dim, 
                             device=e.device, dtype=e.dtype)
@@ -326,7 +326,7 @@ class WanAttentionBlock(nn.Module):
             y = self.ffn(ffn_input)
 
         x_new = x_after_attn + y * e[5]
-        logger.debug(f"cross_attn_ffn output: {x_new.shape}")
+        # logger.debug(f"cross_attn_ffn output: {x_new.shape}")
         return x_new
         
 class Head(nn.Module):
@@ -501,8 +501,8 @@ class WanModel(ModelMixin, ConfigMixin):
 
     def forward(self, x, t, context, seq_len, clip_fea=None, y=None):
         torch.cuda.empty_cache()
-        logger.debug("Starting WanModel.forward")
-        logger.debug(f"Input x type: {type(x)}, length: {len(x) if isinstance(x, list) else 'not list'}")
+        #logger.debug("Starting WanModel.forward")
+        #logger.debug(f"Input x type: {type(x)}, length: {len(x) if isinstance(x, list) else 'not list'}")
 
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
@@ -513,14 +513,14 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # Video embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        logger.debug(f"After patch_embedding: {[u.shape for u in x]}")
+        #logger.debug(f"After patch_embedding: {[u.shape for u in x]}")
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x]).to(device)
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        logger.debug(f"After flatten and transpose: {[u.shape for u in x]}")
+        #logger.debug(f"After flatten and transpose: {[u.shape for u in x]}")
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long, device=device)
         assert seq_lens.max() <= seq_len, f"Max seq len {seq_lens.max()} exceeds limit {seq_len}"
         x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
-        logger.debug(f"After padding and cat: {x.shape}")
+        #logger.debug(f"After padding and cat: {x.shape}")
 
         # Time embeddings
         with amp.autocast(dtype=torch.float32):
@@ -530,7 +530,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # Context embeddings
         context_lens = torch.tensor([u.size(0) for u in context], dtype=torch.long, device=device)  # Compute context lengths
         context = self.text_embedding(torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]))
-        logger.debug(f"Context shape: {context.shape}, context_lens: {context_lens}")
+        #logger.debug(f"Context shape: {context.shape}, context_lens: {context_lens}")
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)
             context = torch.concat([context_clip, context], dim=1)
@@ -539,7 +539,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # Process blocks
         with torch.cuda.amp.autocast(dtype=torch.float16):
             for i, block in enumerate(self.blocks):
-                logger.debug(f"Processing block {i}, x shape: {x.shape if x is not None else 'None'}")
+                #logger.debug(f"Processing block {i}, x shape: {x.shape if x is not None else 'None'}")
                 try:
                     if self.use_checkpoint:
                         x = checkpoint.checkpoint(
@@ -553,12 +553,12 @@ class WanModel(ModelMixin, ConfigMixin):
                 except Exception as e:
                     logger.error(f"Error in block {i}: {str(e)}")
                     raise
-                logger.debug(f"After block {i}, x shape: {x.shape if x is not None else 'None'}")
+                #logger.debug(f"After block {i}, x shape: {x.shape if x is not None else 'None'}")
 
         # Head and unpatchify
-        logger.debug(f"Before head: x shape {x.shape if x is not None else 'None'}")
+        #logger.debug(f"Before head: x shape {x.shape if x is not None else 'None'}")
         x = self.head(x, e)
-        logger.debug(f"Before unpatchify: x shape {x.shape if x is not None else 'None'}")
+        #logger.debug(f"Before unpatchify: x shape {x.shape if x is not None else 'None'}")
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
         
