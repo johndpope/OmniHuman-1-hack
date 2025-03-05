@@ -168,15 +168,15 @@ class T5SelfAttention(nn.Module):
             num_buckets, num_heads, bidirectional=True)
 
     def forward(self, x, mask=None, pos_bias=None):
-        logger.debug("Entering T5SelfAttention forward")
+        # logger.debug("Entering T5SelfAttention forward")
         e = pos_bias if self.shared_pos else self.pos_embedding(x.size(1), x.size(1))
-        # logger.debug("Computed pos_bias")
+        # # logger.debug("Computed pos_bias")
         x = self.norm1(x)
-        # logger.debug("Applied norm1")
+        # # logger.debug("Applied norm1")
         attn_output = self.attn(x, mask=mask, pos_bias=e)
-        # logger.debug("Computed attention")
+        # # logger.debug("Computed attention")
         x = x + attn_output  # Adjust based on your implementation
-        # logger.debug("Added attention output")
+        # # logger.debug("Added attention output")
         return x  # Simplified; add remaining steps as needed
 
 
@@ -310,12 +310,12 @@ class T5Encoder(nn.Module):
         x = self.dropout(x)
         e = self.pos_embedding(x.size(1),
                                x.size(1)) if self.shared_pos else None
-        logger.debug("Starting encoder forward pass")
+        # logger.debug("Starting encoder forward pass")
         for i, block in enumerate(self.blocks):
-            logger.debug(f"Processing block {i+1}/{self.num_layers}")
+            # logger.debug(f"Processing block {i+1}/{self.num_layers}")
             x = block(x, mask, pos_bias=e)
-            logger.debug(f"Completed block {i+1}")
-        logger.debug("Encoder forward pass completed")
+            # logger.debug(f"Completed block {i+1}")
+        # logger.debug("Encoder forward pass completed")
         x = self.norm(x)
         x = self.dropout(x)
         return x
@@ -506,11 +506,11 @@ class T5EncoderModel:
         self.model = model
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)
-            logger.debug("Model sharded using provided shard_fn")
+            # logger.debug("Model sharded using provided shard_fn")
         else:
             self.model.to(self.device)
             model_device = next(self.model.parameters()).device
-            logger.debug(f"Model moved to device: {model_device}")
+            # logger.debug(f"Model moved to device: {model_device}")
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(
             name=tokenizer_path, seq_len=text_len, clean='whitespace')
@@ -518,12 +518,12 @@ class T5EncoderModel:
     def __call__(self, texts, device):
         ids, mask = self.tokenizer(
             texts, return_mask=True, add_special_tokens=True)
-        logger.debug(f"Tokenized input: ids shape {ids.shape}, mask shape {mask.shape}")
+        # logger.debug(f"Tokenized input: ids shape {ids.shape}, mask shape {mask.shape}")
         ids = ids.to(device)
         mask = mask.to(device)
-        logger.debug(f"Moved to device: ids on {ids.device}, mask on {mask.device}")
+        # logger.debug(f"Moved to device: ids on {ids.device}, mask on {mask.device}")
         seq_lens = mask.gt(0).sum(dim=1).long()
-        logger.debug("Starting model forward pass")
+        # logger.debug("Starting model forward pass")
         context = self.model(ids, mask)
-        logger.debug("Model forward pass completed")
+        # logger.debug("Model forward pass completed")
         return [u[:v] for u, v in zip(context, seq_lens)]

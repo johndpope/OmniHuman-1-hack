@@ -137,23 +137,20 @@ RANDOM_PROMPTS = [
     "A whimsical train journey through a land of candy",
 ]
 
-def generate_batch(config, num_samples=100):
-    rank = 0  # Single process for simplicity
+def generate_batch(config, num_samples=100, preprocess_text=True):
+    rank = 0
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logger.debug(f"Using device: {device}")
 
-    # Ensure config has text_len
     if not hasattr(config, 'text_len'):
-        config.text_len = 512  # For text encoder
+        config.text_len = 512
         logger.warning("Config missing 'text_len'. Defaulting to 512.")
 
-    # Extract task and model config
     task = config.task if hasattr(config, 'task') else "t2v-14B"
     cfg = WAN_CONFIGS[task]
     ckpt_dir = config.ckpt_dir if hasattr(config, 'ckpt_dir') else "/path/to/checkpoints"
     logger.debug(f"Task: {task}, Checkpoint dir: {ckpt_dir}")
 
-    # Initialize WanT2V pipeline
     logger.info("Creating WanT2V pipeline.")
     wan_t2v = wan.WanT2V(
         config=cfg,
@@ -166,98 +163,135 @@ def generate_batch(config, num_samples=100):
         t5_cpu=False,
     )
 
-    # Move text encoder and model to GPU
     logger.debug("Moving text encoder to GPU")
     wan_t2v.text_encoder.model.to(device)
-    logger.debug("Moving WanModel to GPU")
-    wan_t2v.model.to(device)
 
-    # Generate multiple samples with random prompts
-    dummy_data_list = []
     dummy_prompts = RANDOM_PROMPTS[:num_samples]
     base_seed = random.randint(0, sys.maxsize) if not hasattr(config, 'base_seed') else config.base_seed
     logger.debug(f"Base seed: {base_seed}, Num samples: {num_samples}")
 
-    # Precompute target latent shape and seq_len
-    size = SIZE_CONFIGS["480*832"]  # (480, 832)
+    size = SIZE_CONFIGS["480*832"]
     target_shape = (
-        wan_t2v.vae.model.z_dim,  # 16 channels
-        1,  # Single frame
-        size[0] // wan_t2v.vae_stride[1],  # 480 / 8 = 60
-        size[1] // wan_t2v.vae_stride[2],  # 832 / 8 = 104
+        wan_t2v.vae.model.z_dim, 1,
+        size[0] // wan_t2v.vae_stride[1],
+        size[1] // wan_t2v.vae_stride[2],
     )
-    patch_size = wan_t2v.model.patch_size  # (1, 2, 2)
+    patch_size = wan_t2v.model.patch_size
     seq_len = (target_shape[1] // patch_size[0]) * \
               (target_shape[2] // patch_size[1]) * \
-              (target_shape[3] // patch_size[2])  # 1 * 30 * 52 = 1560
+              (target_shape[3] // patch_size[2])
     logger.info(f"Computed seq_len: {seq_len}")
-    logger.debug(f"Target latent shape: {target_shape}")
-    logger.debug(f"Patch size: {patch_size}")
 
+    # Preprocess text contexts with padding to fixed length
+    logger.info("Preprocessing text contexts...")
+    positive_contexts = []
+    max_seq_len = config.text_len  # 512 by default
+    for i, prompt in enumerate(dummy_prompts):
+        logger.info(f"Processing prompt {i+1}/{num_samples}: {prompt}")
+        # Use tokenizer with padding to max_seq_len
+        ids, mask = wan_t2v.text_encoder.tokenizer([prompt], return_mask=True, padding='max_length', max_length=max_seq_len, truncation=True)
+        context = wan_t2v.text_encoder.model(ids.to(device), mask.to(device))
+        context = context[0].to(torch.float32).cpu()  # Shape: [max_seq_len, dim]
+        positive_contexts.append(context)
+        torch.cuda.empty_cache()
+
+    logger.info(f"Processing negative prompt: {config.sample_neg_prompt}")
+    # Process negative prompt with padding to max_seq_len
+    neg_ids, neg_mask = wan_t2v.text_encoder.tokenizer([config.sample_neg_prompt], return_mask=True, padding='max_length', max_length=max_seq_len, truncation=True)
+    context_null = wan_t2v.text_encoder.model(neg_ids.to(device), neg_mask.to(device))
+    negative_context = context_null[0].to(torch.float32).cpu()  # Shape: [max_seq_len, dim]
+
+    # Generate latents
+    logger.debug("Moving WanModel to GPU")
+    wan_t2v.model.to(device)
+    dummy_data_list = []
     for i, prompt in enumerate(dummy_prompts):
         seed = base_seed + i
-        
         logger.info(f"Generating sample {i+1}/{num_samples} with prompt: {prompt}")
         with torch.no_grad():
-            # Generate noise in latent space
             seed_g = torch.Generator(device=device)
             seed_g.manual_seed(seed)
-            noise = torch.randn(
-                1, *target_shape,  # [1, 16, 1, 60, 104]
-                dtype=torch.float32,
-                device=device,
-                generator=seed_g
-            )
-            logger.debug(f"Noise shape: {noise.shape}, dtype: {noise.dtype}, device: {noise.device}")
-
-            # Text encoding
-            logger.debug("Encoding prompt")
-            context = wan_t2v.text_encoder([prompt], device)
-            logger.debug(f"Context shape: {context[0].shape}, dtype: {context[0].dtype}, device: {context[0].device}")
-            logger.debug("Encoding negative prompt")
-            context_null = wan_t2v.text_encoder([config.sample_neg_prompt], device)
-            logger.debug(f"Context_null shape: {context_null[0].shape}, dtype: {context_null[0].dtype}, device: {context_null[0].device}")
-
-            # Convert context to float32 to match WanModel
-            context = [c.to(torch.float32) for c in context]
-            context_null = [c.to(torch.float32) for c in context_null]
-            logger.debug(f"Converted context to dtype: {context[0].dtype}")
-            logger.debug(f"Converted context_null to dtype: {context_null[0].dtype}")
-
-            # Diffusion sampling (single step for demo)
+            noise = torch.randn(1, *target_shape, dtype=torch.float32, device=device, generator=seed_g)
+            context = positive_contexts[i].to(device)
+            context_null = negative_context.to(device)
             timestep = torch.tensor([wan_t2v.num_train_timesteps - 1], device=device, dtype=torch.float32)
-            logger.debug(f"Timestep shape: {timestep.shape}, value: {timestep.item()}, dtype: {timestep.dtype}, device: {timestep.device}")
-            noise_list = [noise[0]]  # [16, 1, 60, 104]
-            logger.debug(f"Noise list shape: {noise_list[0].shape}, dtype: {noise_list[0].dtype}, device: {noise_list[0].device}")
+            noise_list = [noise[0]]
+            noise_pred_cond = wan_t2v.model(noise_list, t=timestep, context=[context], seq_len=seq_len)[0]
+            noise_pred_uncond = wan_t2v.model(noise_list, t=timestep, context=[context_null], seq_len=seq_len)[0]
+            latent = noise_pred_uncond + 7.5 * (noise_pred_cond - noise_pred_uncond)
+            dummy_data_list.append(latent.cpu())
+    dummy_data = torch.stack(dummy_data_list, dim=0)
 
-            logger.debug("Running conditioned prediction")
-            noise_pred_cond = wan_t2v.model(noise_list, t=timestep, context=context, seq_len=seq_len)[0]
-            logger.debug(f"Noise_pred_cond shape: {noise_pred_cond.shape}, dtype: {noise_pred_cond.dtype}, device: {noise_pred_cond.device}")
-
-            logger.debug("Running unconditioned prediction")
-            noise_pred_uncond = wan_t2v.model(noise_list, t=timestep, context=context_null, seq_len=seq_len)[0]
-            logger.debug(f"Noise_pred_uncond shape: {noise_pred_uncond.shape}, dtype: {noise_pred_uncond.dtype}, device: {noise_pred_uncond.device}")
-
-            latent = noise_pred_uncond + 7.5 * (noise_pred_cond - noise_pred_uncond)  # CFG scale 7.5
-            logger.debug(f"Generated latent shape: {latent.shape}, dtype: {latent.dtype}, device: {latent.device}")
-            dummy_data_list.append(latent)
-
-    # Stack into [N, C, T, H, W]
-    dummy_data = torch.stack(dummy_data_list, dim=0)  # [100, 16, 1, 60, 104]
-    logger.info(f"Generated dummy_data shape: {dummy_data.shape}, dtype: {dummy_data.dtype}")
-
-    # Move to CPU before saving
-    dummy_data = dummy_data.cpu()
-    logger.debug("Moved dummy_data to CPU")
-    wan_t2v.model.cpu()
-    logger.debug("Moved WanModel to CPU")
+    # Clean up
     wan_t2v.text_encoder.model.cpu()
-    logger.debug("Moved text encoder to CPU")
+    wan_t2v.model.cpu()
     torch.cuda.empty_cache()
-    logger.debug("Cleared CUDA cache")
 
-    return dummy_data, dummy_prompts
+    return dummy_data, dummy_prompts, positive_contexts, negative_context
 
+
+# Adjusted Dataset for Testing
+class TextVideoDataset(torch.utils.data.Dataset):
+    def __init__(self, data_path):
+        # Load precomputed data including positive and negative contexts
+        data_dict = torch.load(data_path, map_location='cpu')
+        self.samples = data_dict['dummy_data']  # Video latents
+        self.positive_contexts = data_dict['positive_contexts']  # Precomputed positive contexts
+        self.negative_context = data_dict['negative_context']  # Precomputed negative context
+        self.num_samples = len(self.samples)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # Return sample and its corresponding precomputed contexts
+        sample = self.samples[idx]
+        positive_context = self.positive_contexts[idx]
+        # Expand negative_context to match batch size (assuming it's a single tensor)
+        negative_context = self.negative_context.expand_as(positive_context)
+        return sample, positive_context, negative_context
+
+def test_text_video_dataset():
+    """Test the TextVideoDataset class with the generated dummy data."""
+    logger.info("Starting TextVideoDataset test...")
+    
+    # Define test parameters
+    data_path = "dummy_data_480x832.pt"
+    
+    # Check if the file exists
+    if not os.path.exists(data_path):
+        logger.error(f"Test file {data_path} not found. Please generate dummy data first.")
+        return
+    
+    # Initialize dataset
+    dataset = TextVideoDataset(data_path)
+    logger.info(f"Dataset initialized with {len(dataset)} samples.")
+
+    # Test length
+    assert len(dataset) > 0, "Dataset length should be greater than 0"
+    logger.info(f"Dataset length test passed: {len(dataset)} samples")
+
+    # Test a few samples
+    for idx in range(min(3, len(dataset))):  # Test first 3 samples or less if dataset is smaller
+        sample, positive_context, negative_context = dataset[idx]
+        
+        # Expected shapes (adjust based on your generate_batch output)
+        expected_sample_shape = torch.Size([16, 1, 60, 104])  # [C, T, H, W]
+        expected_context_shape = torch.Size([512, 4096])     # [L, D] for T5 embeddings
+        
+        # Check shapes
+        assert sample.shape == expected_sample_shape, \
+            f"Sample shape mismatch at index {idx}: got {sample.shape}, expected {expected_sample_shape}"
+        assert positive_context.shape == expected_context_shape, \
+            f"Positive context shape mismatch at index {idx}: got {positive_context.shape}, expected {expected_context_shape}"
+        assert negative_context.shape == expected_context_shape, \
+            f"Negative context shape mismatch at index {idx}: got {negative_context.shape}, expected {expected_context_shape}"
+        
+        # Log successful shape check
+        logger.info(f"Sample {idx} shape test passed: sample={sample.shape}, "
+                    f"positive_context={positive_context.shape}, negative_context={negative_context.shape}")
+
+    logger.info("TextVideoDataset test completed successfully!")
 
 # [INFO] Creating WanT2V pipeline.
 # [DEBUG] Using device: cuda
@@ -273,9 +307,28 @@ def generate_batch(config, num_samples=100):
 if __name__ == "__main__":
     # Load OmegaConf configuration
     config = OmegaConf.load("config.yaml")  # Path to your config file
-    dummy_data, dummy_prompts = generate_batch(config, num_samples=10) # 9062 full set
-    dummy_data = dummy_data.cpu()
-    # Save for training
-    torch.save(dummy_data, "dummy_data.pt")
-    torch.save(dummy_prompts, "dummy_prompts.pt")
-    logger.info(f"Generated dummy_data shape: {dummy_data.shape}")
+    
+    # # Generate data with 10 samples (modify as needed)
+    dummy_data, dummy_prompts, positive_contexts, negative_context = generate_batch(config, num_samples=100) # We use 128∼256 H100 GPUs with gradient accumulation to reach a batch size of 9062.
+    
+    # # Define the size explicitly based on what was used (480*832)
+    size_str = "480x832"  
+    
+    # # Create a dictionary to save all data
+    data_dict = {
+        "dummy_data": dummy_data,
+        "dummy_prompts": dummy_prompts,
+        "positive_contexts": positive_contexts,
+        "negative_context": negative_context
+    }
+    
+    # Save with size in the filename
+    filename = f"dummy_data_{size_str}.pt"
+    torch.save(data_dict, filename)
+    logger.info(f"Generated and saved data_dict to {filename} with keys: {data_dict.keys()}")
+    
+
+    test_text_video_dataset()
+    # Optionally save prompts separately if needed
+    # torch.save(dummy_prompts, f"dummy_prompts_{size_str}.pt")
+    # logger.info(f"Saved dummy_prompts to dummy_prompts_{size_str}.pt")
