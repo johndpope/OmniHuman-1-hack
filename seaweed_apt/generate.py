@@ -177,6 +177,16 @@ def generate_batch(config, args, num_samples=100):
               (target_shape[3] // patch_size[2])
     logger.info(f"Computed seq_len: {seq_len}")
 
+
+        # Why [16, 1, 60, 104]?
+        # It’s the latent shape for one frame of a 480x832 video after VAE encoding with stride [4, 8, 8]:
+        # 16: Latent channels (z_dim).
+        # 60: Height ( 480÷8).
+        # 104: Width (832÷8).
+        # 1: Single temporal frame, with full sequence (e.g., 4 frames from 16) handled by the model or decoding.
+        # What’s the 1 for?
+        # It’s the temporal dimension, set to 1 to generate noise for a single latent frame per sample. This aligns with per-timestep diffusion (e.g., computing v_teacher at T-1), simplifying the batch to 100 independent frames rather than full videos.
+    
     # Precompute contexts
     logger.info("Preprocessing text contexts...")
     wan_t2v.text_encoder.model.to(device)
