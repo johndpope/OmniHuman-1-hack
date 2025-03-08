@@ -73,20 +73,43 @@ wan_t2v = wan.WanT2V(
     use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
     t5_cpu=args.t5_cpu
 )
+# Load EMA model
+ema_path = f"{args.output_dir}/ema_model_epoch_1.pt"
+if not os.path.exists(ema_path):
+    raise FileNotFoundError(f"EMA model file not found at {ema_path}")
+wan_t2v.model.load_state_dict(torch.load(ema_path, map_location=device))
+wan_t2v.model.eval()
+logger.info(f"Loaded EMA model into WanT2V from {ema_path}")
+
+# Load precomputed data
+data_path = "dummy_data_480x832.pt"
+if not os.path.exists(data_path):
+    raise FileNotFoundError(f"Data file not found at {data_path}")
+data_dict = torch.load(data_path, map_location="cpu")
+num_samples = min(args.num_samples, len(data_dict["noise"]))
+noise = data_dict["noise"][:num_samples].to(device)  # [10, 16, 1, 60, 104], 16 is channels
+positive_contexts = [c.to(device) for c in data_dict["positive_contexts"][:num_samples]]
+dummy_prompts = data_dict["dummy_prompts"][:num_samples]
+v_teacher = data_dict["v_teacher"][:num_samples].to(device)
+
+logger.debug(f"Noise shape: {noise.shape}")
+logger.debug(f"v_teacher shape: {v_teacher.shape}")
+logger.debug(f"Number of positive contexts: {len(positive_contexts)}")
+logger.debug(f"First positive context shape: {positive_contexts[0].shape}")
 
 # Compute sequence length (for single frame)
-patch_size = wan_t2v.model.patch_size  # e.g., (1, 2, 2)
+patch_size = wan_t2v.model.patch_size
 vae_stride = wan_t2v.vae_stride  # (4, 8, 8)
 target_shape = (16, 1, 480 // vae_stride[1], 832 // vae_stride[2])  # [16, 1, 60, 104]
 seq_len = (target_shape[1] // patch_size[0]) * \
           (target_shape[2] // patch_size[1]) * \
-          (target_shape[3] // patch_size[2])  # Adjust based on patch_size
+          (target_shape[3] // patch_size[2])
 logger.info(f"Computed seq_len: {seq_len}")
 
 # Generate EMA outputs (single frame)
 logger.info("Generating single-frame outputs from EMA model...")
 x_latent_list = []
-final_timestep = config.num_train_timesteps  # e.g., 1000
+final_timestep = config.num_train_timesteps
 
 with torch.no_grad():
     for i in range(num_samples):
@@ -98,7 +121,6 @@ with torch.no_grad():
         logger.debug(f"Sample noise shape: {sample_noise.shape}")
         logger.debug(f"Sample context shape: {sample_context[0].shape}")
         
-        # One-step generation: v = model(z, T), x = z - v
         v_pred = wan_t2v.model(sample_noise, t, sample_context, seq_len)[0]  # [16, 1, 60, 104]
         sample_output = sample_noise - v_pred  # [1, 16, 1, 60, 104]
         
@@ -115,8 +137,8 @@ logger.info(f"Generated EMA latent outputs with shape: {x_latent.shape}")
 # Decode latents to pixel space (single frame)
 logger.info("Decoding latents to pixel space...")
 try:
-    # Decode with temporal dimension T=1, expecting [B, C, T, H, W]
     x_pixel_list = wan_t2v.vae.decode([x for x in x_latent])  # List of [3, 1, 480, 832]
+    logger.debug(f"Raw VAE output shape for first sample: {x_pixel_list[0].shape}")
     x_pixel = torch.stack(x_pixel_list).squeeze(2).cpu().numpy()  # [10, 3, 480, 832], remove T=1
     logger.info(f"Decoded latents to pixel space with shape: {x_pixel.shape}")
 except Exception as e:
@@ -125,14 +147,19 @@ except Exception as e:
     traceback.print_exc()
     raise
 
-# Save Generated Images (not videos)
+# Save Generated Images
 os.makedirs("eval_images", exist_ok=True)
 for i, image in enumerate(x_pixel):
-    # Normalize from [-1, 1] to [0, 255]
-    image_uint8 = ((image + 1) / 2 * 255).astype(np.uint8).transpose(1, 2, 0)  # [480, 832, 3]
+    # Normalize and transpose to [H, W, C]
+    logger.debug(f"Image shape before processing: {image.shape}")
+    image_uint8 = ((image.transpose(1, 2, 0) + 1) / 2 * 255).astype(np.uint8)  # [480, 832, 3]
     output_path = f"eval_images/eval_image_{i}.png"
     imageio.imwrite(output_path, image_uint8)
-    logger.info(f"Saved image {i} to {output_path}")
+    # Verify saved image size
+    with Image.open(output_path) as img:
+        saved_size = img.size
+        logger.info(f"Saved image {i} to {output_path} with size {saved_size}")
+
 
 # 1. FVD - Compare to real videos
 # def load_real_videos(directory, num_samples, shape=(16, 480, 832, 3)):
@@ -212,11 +239,11 @@ for i, image in enumerate(x_pixel):
 # logger.info(f"Avg PSNR: {psnr:.2f}, Avg SSIM: {ssim:.4f}")
 
 # 4. Save Generated Videos
-os.makedirs("eval_videos", exist_ok=True)
-for i, video in enumerate(x_pixel):
-    video_uint8 = ((video + 1) / 2 * 255).astype(np.uint8).transpose(0, 2, 3, 1)  # [T, H, W, C], [0, 255]
-    output_path = f"eval_videos/eval_video_{i}.mp4"
-    imageio.mimwrite(output_path, video_uint8, fps=16)  # Assuming 1-second clips, adjust FPS as needed
-    logger.info(f"Saved video {i} to {output_path}")
+# os.makedirs("eval_videos", exist_ok=True)
+# for i, video in enumerate(x_pixel):
+#     video_uint8 = ((video + 1) / 2 * 255).astype(np.uint8).transpose(0, 2, 3, 1)  # [T, H, W, C], [0, 255]
+#     output_path = f"eval_videos/eval_video_{i}.mp4"
+#     imageio.mimwrite(output_path, video_uint8, fps=16)  # Assuming 1-second clips, adjust FPS as needed
+#     logger.info(f"Saved video {i} to {output_path}")
 
 logger.info("Evaluation complete.")

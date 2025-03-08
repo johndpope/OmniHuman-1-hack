@@ -10,7 +10,6 @@ import wandb
 from omegaconf import OmegaConf
 from accelerate import Accelerator
 
-from video_hidtr import HiDETRWanModel
 from wan.modules.model import WanModel
 from wan.utils.utils import str2bool
 import gc
