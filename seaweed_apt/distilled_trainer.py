@@ -61,7 +61,7 @@ def train_consistency_distillation(
 
     # Model setup
     logger.debug(f"Loading model from {checkpoint_dir}")
-    distilled_model = HiDETRWanModel.from_pretrained(checkpoint_dir)
+    distilled_model = WanModel.from_pretrained(checkpoint_dir)
     distilled_model.use_checkpoint = use_gradient_checkpointing
     
     # Use AdamW optimizer for lower memory usage
