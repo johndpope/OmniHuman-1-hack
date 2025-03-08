@@ -38,7 +38,7 @@ parser.add_argument("--t5_cpu", action="store_true", default=False, help="Whethe
 parser.add_argument("--dit_fsdp", action="store_true", default=False, help="Whether to use FSDP for DiT.")
 parser.add_argument("--ulysses_size", type=int, default=1, help="The size of the ulysses parallelism in DiT.")
 parser.add_argument("--t5_fsdp", action="store_true", default=False, help="Whether to use FSDP for T5.")
-
+parser.add_argument("--ring_size", type=int, default=1, help="The size of the ring attention parallelism in DiT.")
 args = parser.parse_args()
 
 # Setup
