@@ -18,62 +18,8 @@ from wan.configs import WAN_CONFIGS
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_video, str2bool
 import argparse
-# from distilled_trainer import HRRTextVideoDataset
-import torch
-import torch.fft
+from distilled_trainer import TextVideoDataset
 
-
-
-class HRRTextVideoDataset(Dataset):
-    def __init__(self, data_path):
-        data_dict = torch.load(data_path, map_location='cpu')
-        self.noise = data_dict['noise']  # [100, 16, 1, 60, 104]
-        self.positive_contexts = data_dict['positive_contexts']  # List of [512, 4096]
-        self.v_teacher = data_dict['v_teacher']  # [100, 16, 1, 60, 104]
-        self.hrr_fingerprints = data_dict['hrr_fingerprints']  # [100, 4096]
-        self.hrr_keys = data_dict['hrr_keys']  # [100, 4096]
-        self.hrr_proj_weight = data_dict['hrr_proj_weight']  # [4096, 998400]
-        self.num_samples = len(self.noise)
-
-    def __getitem__(self, idx):
-        return (
-            self.noise[idx],
-            self.positive_contexts[idx],
-            self.v_teacher[idx],
-            self.hrr_fingerprints[idx],
-            self.hrr_keys[idx],
-            self.hrr_proj_weight
-        )
-    
-def circular_convolution(x, y):
-    """Circular convolution via FFT for HRR encoding."""
-    x_fft = torch.fft.fft(x)
-    y_fft = torch.fft.fft(y)
-    conv_fft = x_fft * y_fft
-    return torch.fft.ifft(conv_fft).real
-
-def hrr_encode(latent, key, output_dim=4096):
-    """Encode latent into HRR fingerprint."""
-    # latent: [B, 16, 1, 60, 104] -> [B, 998400]
-    # key: [B, 512, 4096] -> [B, 4096]
-    B = latent.shape[0]
-    latent_flat = latent.flatten(1)  # [B, 998400]
-    
-    # Project latent to match key dimension
-    proj = nn.Linear(998400, output_dim, bias=False).to(latent.device)
-    latent_proj = proj(latent_flat)  # [B, 4096]
-    
-    # Circular convolution with key (e.g., mean-pooled context)
-    hrr = circular_convolution(latent_proj, key)  # [B, 4096]
-    return hrr, proj.weight  # Return encoding and projection weights for decoding
-
-def hrr_decode(hrr, key, proj_weight):
-    """Decode HRR back to latent space."""
-    # hrr: [B, 4096], key: [B, 4096], proj_weight: [4096, 998400]
-    B = hrr.shape[0]
-    latent_proj = circular_convolution(hrr, key)  # [B, 4096]
-    latent_flat = torch.matmul(latent_proj, proj_weight)  # [B, 998400]
-    return latent_flat.view(B, 16, 1, 60, 104)  # [B, 16, 1, 60, 104]
 
 # Example prompt for fallback
 EXAMPLE_PROMPT = {
@@ -334,75 +280,90 @@ def generate_batch(config, args, num_samples=100):
 
     return data_dict
 
-
-def generate_batch(config, args, num_samples=100):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    wan_t2v = wan.WanT2V(config=config, checkpoint_dir=args.checkpoint_dir, device_id=0, rank=0, t5_fsdp=args.t5_fsdp, dit_fsdp=args.dit_fsdp, use_usp=(args.ulysses_size > 1 or args.ring_size > 1), t5_cpu=args.t5_cpu)
-    
-    dummy_prompts = RANDOM_PROMPTS[:num_samples]
-    base_seed = random.randint(0, sys.maxsize) if not hasattr(config, 'base_seed') else config.base_seed
-    size = SIZE_CONFIGS["480*832"]
-    target_shape = (wan_t2v.vae.model.z_dim, 1, size[0] // wan_t2v.vae_stride[1], size[1] // wan_t2v.vae_stride[2])
-    seq_len = 1560
-
-    # Precompute contexts
-    wan_t2v.text_encoder.model.to(device)
-    positive_contexts = []
-    max_seq_len = config.text_len
-    for prompt in dummy_prompts:
-        ids, mask = wan_t2v.text_encoder.tokenizer([prompt], return_mask=True, padding='max_length', max_length=max_seq_len, truncation=True)
-        context = wan_t2v.text_encoder.model(ids.to(device), mask.to(device))[0].to(torch.float32).cpu()
-        positive_contexts.append(context)
-    neg_ids, neg_mask = wan_t2v.text_encoder.tokenizer([config.sample_neg_prompt], return_mask=True, padding='max_length', max_length=max_seq_len, truncation=True)
-    negative_context = wan_t2v.text_encoder.model(neg_ids.to(device), neg_mask.to(device))[0].to(torch.float32).cpu()
-
-    # Generate with HRR
-    noise_list, v_teacher_list, hrr_list, key_list = [], [], [], []
-    timestep = torch.tensor([wan_t2v.num_train_timesteps - 1], device=device, dtype=torch.float32)
-    cfg_scale = 7.5
-
-    wan_t2v.model.to(device)
-    for i in range(num_samples):
-        seed_g = torch.Generator(device=device).manual_seed(base_seed + i)
-        noise = torch.randn(target_shape, dtype=torch.float32, device=device, generator=seed_g)
+# Adjusted Dataset for Testing
+# class TextVideoDataset(Dataset):
+#     """
+#     Dataset for handling precomputed tensors for APT (Adversarial Post-Training).
+#     This version handles batch dimension issues and ensures correct tensor shapes.
+#     """
+#     def __init__(self, data_path):
+#         """
+#         Initialize dataset from precomputed tensors.
         
-        with torch.no_grad():
-            context = positive_contexts[i].to(device)
-            context_null = negative_context.to(device)
-            noise_input = noise.unsqueeze(0)
-            noise_pred_cond = wan_t2v.model(noise_input, t=timestep, context=[context], seq_len=seq_len)[0]
-            noise_pred_uncond = wan_t2v.model(noise_input, t=timestep, context=[context_null], seq_len=seq_len)[0]
-            v_teacher = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
-            
-            # HRR Fingerprinting
-            key = context.mean(dim=0)  # [4096], prompt-derived key
-            hrr, proj_weight = hrr_encode(v_teacher, key)  # [1, 4096]
-            
-            noise_list.append(noise.cpu())
-            v_teacher_list.append(v_teacher.cpu())
-            hrr_list.append(hrr.cpu())
-            key_list.append(key.cpu())
+#         Args:
+#             data_path (str): Path to precomputed tensor file (.pt)
+#         """
+#         logger.info(f"Loading data from {data_path}")
+#         if not os.path.exists(data_path):
+#             raise FileNotFoundError(f"Data file {data_path} not found. Please generate data first.")
         
-        torch.cuda.empty_cache()
+#         # Load precomputed data
+#         data_dict = torch.load(data_path, map_location='cpu')
+        
+#         # Extract tensors with shape validation
+#         self.samples = data_dict['dummy_data']  # Shape: [num_samples, 16, 1, 60, 104]
+#         self.noise = data_dict['noise']          # Shape: [num_samples, 16, 1, 60, 104]
+#         self.positive_contexts = data_dict['positive_contexts']  # List of [512, 4096] tensors
+#         self.negative_context = data_dict['negative_context']    # Shape: [512, 4096]
+#         self.v_teacher = data_dict['v_teacher']  # Shape: [num_samples, 16, 1, 60, 104]
+        
+#         self.num_samples = len(self.samples)
+        
+#         # Log shapes for debugging
+#         logger.info(f"Dataset initialized with {self.num_samples} samples")
+#         logger.info(f"Tensor shapes: samples={self.samples.shape}, noise={self.noise.shape}, "
+#                    f"positive_contexts[0]={self.positive_contexts[0].shape}, "
+#                    f"negative_context={self.negative_context.shape}, "
+#                    f"v_teacher={self.v_teacher.shape}")
+        
+#         # Validate shapes
+#         self._validate_shapes()
 
-    # Compile data dictionary
-    data_dict = {
-        "noise": torch.stack(noise_list),  # [100, 16, 1, 60, 104]
-        "positive_contexts": positive_contexts,
-        "negative_context": negative_context,
-        "v_teacher": torch.stack(v_teacher_list),  # [100, 16, 1, 60, 104]
-        "hrr_fingerprints": torch.stack(hrr_list),  # [100, 4096]
-        "hrr_keys": torch.stack(key_list),  # [100, 4096]
-        "hrr_proj_weight": proj_weight.cpu()  # [4096, 998400], shared across batch
-    }
-    
-    filename = f"dummy_data_{size[0]}x{size[1]}.pt"
-    torch.save(data_dict, filename)
-    logger.info(f"Saved data_dict to {filename} with keys: {data_dict.keys()}")
-    return data_dict
+#     def _validate_shapes(self):
+#         """Validate tensor shapes to catch issues early"""
+#         expected_sample_shape = (16, 1, 60, 104)
+#         expected_context_shape = (512, 4096)
+        
+#         # Check first sample shape (excluding batch dimension)
+#         sample_shape = tuple(self.samples[0].shape)
+#         if sample_shape != expected_sample_shape:
+#             logger.warning(f"Sample shape mismatch: got {sample_shape}, expected {expected_sample_shape}")
+        
+#         # Check first positive context shape
+#         context_shape = tuple(self.positive_contexts[0].shape)
+#         if context_shape != expected_context_shape:
+#             logger.warning(f"Positive context shape mismatch: got {context_shape}, expected {expected_context_shape}")
+        
+#         # Check negative context shape
+#         neg_context_shape = tuple(self.negative_context.shape)
+#         if neg_context_shape != expected_context_shape:
+#             logger.warning(f"Negative context shape mismatch: got {neg_context_shape}, expected {expected_context_shape}")
+
+#     def __len__(self):
+#         """Return number of samples in dataset"""
+#         return self.num_samples
+
+#     def __getitem__(self, idx):
+#         """
+#         Get a training example.
+        
+#         Returns:
+#             tuple: (noise, positive_context, negative_context, v_teacher)
+#                 - noise: Shape [16, 1, 60, 104] - The input noise
+#                 - positive_context: Shape [512, 4096] - Positive text embedding
+#                 - negative_context: Shape [512, 4096] - Negative text embedding
+#                 - v_teacher: Shape [16, 1, 60, 104] - Target prediction
+#         """
+#         # Get specific samples by index
+#         noise = self.noise[idx]  # [16, 1, 60, 104]
+#         v_teacher = self.v_teacher[idx]  # [16, 1, 60, 104]
+#         positive_context = self.positive_contexts[idx]  # [512, 4096]
+        
+#         # Return tensors with correct shapes for model input
+#         return noise, positive_context, self.negative_context, v_teacher
 
 def create_dataloader(data_path, batch_size=1):
-    dataset = HRRTextVideoDataset(data_path)
+    dataset = TextVideoDataset(data_path)
     def custom_collate(batch):
         noise = torch.stack([item[0] for item in batch])  # [B, 16, 1, 60, 104]
         pos_ctx = torch.stack([item[1] for item in batch])  # [B, 512, 4096]
@@ -412,9 +373,9 @@ def create_dataloader(data_path, batch_size=1):
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate), dataset
 
 def test_dataset(data_path="dummy_data_480x832.pt"):
-    """Test the HRRTextVideoDataset and print sample shapes"""
+    """Test the TextVideoDataset and print sample shapes"""
     try:
-        dataset = HRRTextVideoDataset(data_path)
+        dataset = TextVideoDataset(data_path)
         logger.info(f"Successfully loaded dataset with {len(dataset)} samples")
         
         # Test getting a single item (3 items)
@@ -471,7 +432,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     from wan.configs import t2v_14B, t2v_1_3B
-    data_dict = generate_batch(t2v_1_3B, args,num_samples=9000)
+    data_dict = generate_batch(t2v_1_3B, args,num_samples=100)
     
     success = test_dataset()
     if success:
