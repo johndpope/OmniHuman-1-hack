@@ -5,7 +5,7 @@ import imageio
 from PIL import Image
 import argparse
 import os
-import logging
+from logger import logger
 
 # Install these dependencies if not already present
 try:
@@ -28,20 +28,17 @@ from wan import WanT2V
 # Argument parsing
 parser = argparse.ArgumentParser(description="Evaluate EMA distilled model")
 parser.add_argument("--checkpoint_dir", type=str, default="../models/Wan2.1-T2V-1.3B", help="Path to pretrained model checkpoint")
-parser.add_argument("--output_dir", type=str, default="./output", help="Directory with EMA model")
+parser.add_argument("--output_dir", type=str, default="./", help="Directory with EMA model")
 parser.add_argument("--vae_path", type=str, default="cache/vae_step_411000.pth", help="Path to VAE checkpoint")
 parser.add_argument("--real_video_dir", type=str, default="./real_videos", help="Directory with real videos for FVD")
 args = parser.parse_args()
 
 # Setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-logger.info(f"Using device: {device}")
 
 # Load EMA model
 ema_model = WanModel.from_pretrained(args.checkpoint_dir).to(device)
-ema_path = f"{args.output_dir}/ema_model_final.pt"
+ema_path = f"{args.output_dir}/ema_model_epoch_8.pt"
 if not os.path.exists(ema_path):
     raise FileNotFoundError(f"EMA model file not found at {ema_path}")
 ema_model.load_state_dict(torch.load(ema_path, map_location=device))
