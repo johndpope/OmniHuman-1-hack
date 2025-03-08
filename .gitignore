@@ -4,6 +4,7 @@
 *.bin
 *.pkl
 *.safetensors
+seaweed_apt/eval_videos/*
 project.log
 models/
 seaweed_apt/wandb/*
