@@ -499,7 +499,7 @@ if __name__ == "__main__":
     logger.info("Preprocessing text contexts...")
     wan_t2v.text_encoder.model.to(device)
 
-    data_dict = generate_batch(wan_t2v, args,num_samples=100)
+    data_dict = generate_batch(wan_t2v, num_samples=100)
     # test_diffusers_pipeline(wan_t2v, prompt="A beautiful landscape with mountains and a lake", size=(480, 832), cfg_scale=7.5, seed=42)
    
     
