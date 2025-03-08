@@ -34,6 +34,11 @@ parser.add_argument("--checkpoint_dir", type=str, default="../models/Wan2.1-T2V-
 parser.add_argument("--output_dir", type=str, default="./", help="Directory with EMA model")
 parser.add_argument("--vae_path", type=str, default="cache/vae_step_411000.pth", help="Path to VAE checkpoint")
 parser.add_argument("--real_video_dir", type=str, default="./real_videos", help="Directory with real videos for FVD")
+parser.add_argument("--t5_cpu", action="store_true", default=False, help="Whether to place T5 model on CPU.")
+parser.add_argument("--dit_fsdp", action="store_true", default=False, help="Whether to use FSDP for DiT.")
+parser.add_argument("--ulysses_size", type=int, default=1, help="The size of the ulysses parallelism in DiT.")
+parser.add_argument("--t5_fsdp", action="store_true", default=False, help="Whether to use FSDP for T5.")
+
 args = parser.parse_args()
 
 # Setup
@@ -61,6 +66,8 @@ v_teacher = data_dict["v_teacher"][:num_samples].to(device)
 
 rank = 0  
 # Load WanT2V and VAE
+from wan.configs import t2v_14B, t2v_1_3B
+config = t2v_1_3B
 wan_t2v = wan.WanT2V(
     config=config,
     checkpoint_dir=args.checkpoint_dir,

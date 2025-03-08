@@ -2,5 +2,4 @@ export PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.6,max_split_size_m
 
 rm project.log
 nvidia-smi
-
-python eval_ema.py --checkpoint_dir ../models/Wan2.1-T2V-1.3B
+python eval_ema.py --output_dir . --checkpoint_dir ../models/Wan2.1-T2V-1.3B --t5_cpu
