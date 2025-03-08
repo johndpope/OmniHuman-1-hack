@@ -73,24 +73,20 @@ wan_t2v = wan.WanT2V(
     use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
     t5_cpu=args.t5_cpu
 )
-logger.debug(f"Noise shape: {noise.shape}")
-logger.debug(f"v_teacher shape: {v_teacher.shape}")
-logger.debug(f"Number of positive contexts: {len(positive_contexts)}")
-logger.debug(f"First positive context shape: {positive_contexts[0].shape}")
 
-# Compute sequence length
-patch_size = wan_t2v.model.patch_size
-vae_stride = wan_t2v.vae_stride
+# Compute sequence length (for single frame)
+patch_size = wan_t2v.model.patch_size  # e.g., (1, 2, 2)
+vae_stride = wan_t2v.vae_stride  # (4, 8, 8)
 target_shape = (16, 1, 480 // vae_stride[1], 832 // vae_stride[2])  # [16, 1, 60, 104]
 seq_len = (target_shape[1] // patch_size[0]) * \
           (target_shape[2] // patch_size[1]) * \
-          (target_shape[3] // patch_size[2])  # Should be 1560
+          (target_shape[3] // patch_size[2])  # Adjust based on patch_size
 logger.info(f"Computed seq_len: {seq_len}")
 
-# Generate EMA outputs
-logger.info("Generating outputs from EMA model...")
+# Generate EMA outputs (single frame)
+logger.info("Generating single-frame outputs from EMA model...")
 x_latent_list = []
-final_timestep = config.num_train_timesteps  # Use final timestep (e.g., 1000) for one-step generation
+final_timestep = config.num_train_timesteps  # e.g., 1000
 
 with torch.no_grad():
     for i in range(num_samples):
@@ -112,40 +108,31 @@ with torch.no_grad():
         x_latent_list.append(sample_output.cpu())
         torch.cuda.empty_cache()
 
-# Stack latents correctly
+# Stack latents
 x_latent = torch.cat(x_latent_list, dim=0).to(device)  # [10, 16, 1, 60, 104]
 logger.info(f"Generated EMA latent outputs with shape: {x_latent.shape}")
 
-# Decode latents to pixel space
+# Decode latents to pixel space (single frame)
 logger.info("Decoding latents to pixel space...")
 try:
-    # Ensure VAE expects [B, C, T, H, W]
-    if x_latent.shape[2] == 1:  # [10, 16, 1, 60, 104]
-        logger.warning("Latent has T=1; generating single-frame videos. Multi-frame generation may require noise adjustment.")
-    
-    # Decode each sample's latent to pixel space
-    x_pixel_list = wan_t2v.vae.decode([x.squeeze(0) for x in x_latent.chunk(num_samples)])  # List of [C, T, H, W]
-    
-    # Move to CPU and convert to NumPy
-    x_pixel = torch.stack(x_pixel_list).cpu().numpy()  # [10, 3, T, 480, 832]
+    # Decode with temporal dimension T=1, expecting [B, C, T, H, W]
+    x_pixel_list = wan_t2v.vae.decode([x for x in x_latent])  # List of [3, 1, 480, 832]
+    x_pixel = torch.stack(x_pixel_list).squeeze(2).cpu().numpy()  # [10, 3, 480, 832], remove T=1
     logger.info(f"Decoded latents to pixel space with shape: {x_pixel.shape}")
 except Exception as e:
     logger.error(f"Error decoding latents: {e}")
     import traceback
     traceback.print_exc()
-    raise  # Re-raise the exception to halt execution and debug properly
+    raise
 
-# Save Generated Videos
-if x_pixel is not None:  # This check is redundant now but kept for clarity
-    os.makedirs("eval_videos", exist_ok=True)
-    for i, video in enumerate(x_pixel):
-        # Normalize from [-1, 1] to [0, 255] and adjust axes
-        video_uint8 = ((video.transpose(1, 2, 3, 0) + 1) / 2 * 255).astype(np.uint8)  # [T, H, W, 3]
-        output_path = f"eval_videos/eval_video_{i}.mp4"
-        imageio.mimwrite(output_path, video_uint8, fps=16)  # Adjust fps as needed
-        logger.info(f"Saved video {i} to {output_path}")
-else:
-    logger.error("No videos generated due to decoding failure.")
+# Save Generated Images (not videos)
+os.makedirs("eval_images", exist_ok=True)
+for i, image in enumerate(x_pixel):
+    # Normalize from [-1, 1] to [0, 255]
+    image_uint8 = ((image + 1) / 2 * 255).astype(np.uint8).transpose(1, 2, 0)  # [480, 832, 3]
+    output_path = f"eval_images/eval_image_{i}.png"
+    imageio.imwrite(output_path, image_uint8)
+    logger.info(f"Saved image {i} to {output_path}")
 
 # 1. FVD - Compare to real videos
 # def load_real_videos(directory, num_samples, shape=(16, 480, 832, 3)):
