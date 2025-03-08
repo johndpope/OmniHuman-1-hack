@@ -10,12 +10,6 @@ import wan
 from wan.configs import WAN_CONFIGS
 
 
-# Install these dependencies if not already present
-try:
-    from pytorch_fvd import fvd
-except ImportError:
-    print("Warning: pytorch_fvd not installed. FVD computation skipped. Install with: pip install pytorch-fvd")
-    fvd = None
 
 try:
     import clip
@@ -156,81 +150,81 @@ except Exception as e:
 
 
 # 1. FVD - Compare to real videos
-def load_real_videos(directory, num_samples, shape=(16, 480, 832, 3)):
-    """Load real videos from a directory of .mp4 files."""
-    import glob
-    video_files = glob.glob(os.path.join(directory, "*.mp4"))[:num_samples]
-    if not video_files:
-        logger.warning(f"No real videos found in {directory}. FVD skipped.")
-        return None
-    real_videos = []
-    for vf in video_files:
-        reader = imageio.get_reader(vf)
-        frames = [frame for frame in reader][:shape[0]]  # Take first T frames
-        if len(frames) < shape[0]:
-            frames += [frames[-1]] * (shape[0] - len(frames))  # Pad with last frame
-        video = np.stack(frames, axis=0) / 255.0 * 2 - 1  # Normalize to [-1, 1]
-        real_videos.append(video)
-    return np.stack(real_videos, axis=0)  # [N, T, H, W, C]
+# def load_real_videos(directory, num_samples, shape=(16, 480, 832, 3)):
+#     """Load real videos from a directory of .mp4 files."""
+#     import glob
+#     video_files = glob.glob(os.path.join(directory, "*.mp4"))[:num_samples]
+#     if not video_files:
+#         logger.warning(f"No real videos found in {directory}. FVD skipped.")
+#         return None
+#     real_videos = []
+#     for vf in video_files:
+#         reader = imageio.get_reader(vf)
+#         frames = [frame for frame in reader][:shape[0]]  # Take first T frames
+#         if len(frames) < shape[0]:
+#             frames += [frames[-1]] * (shape[0] - len(frames))  # Pad with last frame
+#         video = np.stack(frames, axis=0) / 255.0 * 2 - 1  # Normalize to [-1, 1]
+#         real_videos.append(video)
+#     return np.stack(real_videos, axis=0)  # [N, T, H, W, C]
 
-if fvd is not None:
-    real_videos = load_real_videos(args.real_video_dir, num_samples)
-    if real_videos is not None:
-        gen_videos = ((x_pixel + 1) / 2 * 255).astype(np.uint8).transpose(0, 1, 3, 4, 2)  # [N, T, H, W, C], [0, 255]
-        # Resize for I3D (224x224, 16 frames)
-        from skimage.transform import resize
-        real_videos_resized = resize(real_videos, (num_samples, 16, 224, 224, 3), preserve_range=True).astype(np.uint8)
-        gen_videos_resized = resize(gen_videos, (num_samples, 16, 224, 224, 3), preserve_range=True).astype(np.uint8)
-        real_videos_torch = torch.from_numpy(real_videos_resized).permute(0, 4, 1, 2, 3).to(device)  # [N, C, T, H, W]
-        gen_videos_torch = torch.from_numpy(gen_videos_resized).permute(0, 4, 1, 2, 3).to(device)
-        fvd_score = fvd(real_videos_torch, gen_videos_torch, device=device)
-        logger.info(f"FVD: {fvd_score.item()}")
-    else:
-        logger.info("FVD computation skipped due to missing real videos.")
-else:
-    logger.info("FVD computation skipped due to missing pytorch_fvd.")
+# if fvd is not None:
+#     real_videos = load_real_videos(args.real_video_dir, num_samples)
+#     if real_videos is not None:
+#         gen_videos = ((x_pixel + 1) / 2 * 255).astype(np.uint8).transpose(0, 1, 3, 4, 2)  # [N, T, H, W, C], [0, 255]
+#         # Resize for I3D (224x224, 16 frames)
+#         from skimage.transform import resize
+#         real_videos_resized = resize(real_videos, (num_samples, 16, 224, 224, 3), preserve_range=True).astype(np.uint8)
+#         gen_videos_resized = resize(gen_videos, (num_samples, 16, 224, 224, 3), preserve_range=True).astype(np.uint8)
+#         real_videos_torch = torch.from_numpy(real_videos_resized).permute(0, 4, 1, 2, 3).to(device)  # [N, C, T, H, W]
+#         gen_videos_torch = torch.from_numpy(gen_videos_resized).permute(0, 4, 1, 2, 3).to(device)
+#         fvd_score = fvd(real_videos_torch, gen_videos_torch, device=device)
+#         logger.info(f"FVD: {fvd_score.item()}")
+#     else:
+#         logger.info("FVD computation skipped due to missing real videos.")
+# else:
+#     logger.info("FVD computation skipped due to missing pytorch_fvd.")
 
-# 2. CLIP Score - Text-video alignment
-if clip is not None:
-    clip_model, preprocess = clip.load("ViT-B/32", device=device)
-    frames = x_pixel[:, ::4].reshape(-1, 480, 832, 3)  # Every 4th frame: [40, H, W, 3]
-    frames_processed = []
-    for frame in frames:
-        frame_img = Image.fromarray(((frame + 1) / 2 * 255).astype(np.uint8))
-        frames_processed.append(preprocess(frame_img))
-    frames_tensor = torch.stack(frames_processed).to(device)  # [40, 3, 224, 224]
-    prompts_tensor = clip.tokenize(dummy_prompts).to(device)  # [10, 77]
+# # 2. CLIP Score - Text-video alignment
+# if clip is not None:
+#     clip_model, preprocess = clip.load("ViT-B/32", device=device)
+#     frames = x_pixel[:, ::4].reshape(-1, 480, 832, 3)  # Every 4th frame: [40, H, W, 3]
+#     frames_processed = []
+#     for frame in frames:
+#         frame_img = Image.fromarray(((frame + 1) / 2 * 255).astype(np.uint8))
+#         frames_processed.append(preprocess(frame_img))
+#     frames_tensor = torch.stack(frames_processed).to(device)  # [40, 3, 224, 224]
+#     prompts_tensor = clip.tokenize(dummy_prompts).to(device)  # [10, 77]
     
-    with torch.no_grad():
-        image_features = clip_model.encode_image(frames_tensor)  # [40, 512]
-        text_features = clip_model.encode_text(prompts_tensor)  # [10, 512]
-        # Average image features per video
-        image_features = image_features.reshape(num_samples, -1, 512).mean(dim=1)  # [10, 512]
-        clip_score = (image_features @ text_features.T).diagonal().mean().item()
-        logger.info(f"CLIP Score: {clip_score}")
-else:
-    logger.info("CLIP Score computation skipped due to missing clip.")
+#     with torch.no_grad():
+#         image_features = clip_model.encode_image(frames_tensor)  # [40, 512]
+#         text_features = clip_model.encode_text(prompts_tensor)  # [10, 512]
+#         # Average image features per video
+#         image_features = image_features.reshape(num_samples, -1, 512).mean(dim=1)  # [10, 512]
+#         clip_score = (image_features @ text_features.T).diagonal().mean().item()
+#         logger.info(f"CLIP Score: {clip_score}")
+# else:
+#     logger.info("CLIP Score computation skipped due to missing clip.")
 
-# 3. PSNR/SSIM vs. Teacher
-with torch.no_grad():
-    x_teacher = noise - v_teacher  # Reconstruct teacher output
-    x_teacher_pixel = vae.decode([x.squeeze(2) for x in x_teacher.chunk(num_samples)])  # [10, T, H, W, 3]
-    x_teacher_pixel = torch.stack(x_teacher_pixel).cpu().numpy()  # [10, T, 480, 832, 3]
+# # 3. PSNR/SSIM vs. Teacher
+# with torch.no_grad():
+#     x_teacher = noise - v_teacher  # Reconstruct teacher output
+#     x_teacher_pixel = vae.decode([x.squeeze(2) for x in x_teacher.chunk(num_samples)])  # [10, T, H, W, 3]
+#     x_teacher_pixel = torch.stack(x_teacher_pixel).cpu().numpy()  # [10, T, 480, 832, 3]
 
-psnr_scores = []
-ssim_scores = []
-for i in range(num_samples):
-    # Compute per-frame PSNR/SSIM and average
-    psnr_frame = [peak_signal_noise_ratio(x_teacher_pixel[i, j], x_pixel[i, j], data_range=2.0) 
-                  for j in range(x_pixel.shape[1])]
-    ssim_frame = [structural_similarity(x_teacher_pixel[i, j], x_pixel[i, j], multichannel=True, channel_axis=-1, data_range=2.0) 
-                  for j in range(x_pixel.shape[1])]
-    psnr_scores.append(np.mean(psnr_frame))
-    ssim_scores.append(np.mean(ssim_frame))
+# psnr_scores = []
+# ssim_scores = []
+# for i in range(num_samples):
+#     # Compute per-frame PSNR/SSIM and average
+#     psnr_frame = [peak_signal_noise_ratio(x_teacher_pixel[i, j], x_pixel[i, j], data_range=2.0) 
+#                   for j in range(x_pixel.shape[1])]
+#     ssim_frame = [structural_similarity(x_teacher_pixel[i, j], x_pixel[i, j], multichannel=True, channel_axis=-1, data_range=2.0) 
+#                   for j in range(x_pixel.shape[1])]
+#     psnr_scores.append(np.mean(psnr_frame))
+#     ssim_scores.append(np.mean(ssim_frame))
 
-psnr = np.mean(psnr_scores)
-ssim = np.mean(ssim_scores)
-logger.info(f"Avg PSNR: {psnr:.2f}, Avg SSIM: {ssim:.4f}")
+# psnr = np.mean(psnr_scores)
+# ssim = np.mean(ssim_scores)
+# logger.info(f"Avg PSNR: {psnr:.2f}, Avg SSIM: {ssim:.4f}")
 
 # 4. Save Generated Videos
 os.makedirs("eval_videos", exist_ok=True)
