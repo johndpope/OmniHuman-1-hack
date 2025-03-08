@@ -32,7 +32,7 @@ from wan import WanT2V
 parser = argparse.ArgumentParser(description="Evaluate EMA distilled model")
 parser.add_argument("--checkpoint_dir", type=str, default="../models/Wan2.1-T2V-1.3B", help="Path to pretrained model checkpoint")
 parser.add_argument("--output_dir", type=str, default="./", help="Directory with EMA model")
-parser.add_argument("--vae_path", type=str, default="cache/vae_step_411000.pth", help="Path to VAE checkpoint")
+parser.add_argument("--vae_path", type=str, default="../models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth", help="Path to VAE checkpoint")
 parser.add_argument("--real_video_dir", type=str, default="./real_videos", help="Directory with real videos for FVD")
 parser.add_argument("--t5_cpu", action="store_true", default=False, help="Whether to place T5 model on CPU.")
 parser.add_argument("--dit_fsdp", action="store_true", default=False, help="Whether to use FSDP for DiT.")
@@ -78,6 +78,8 @@ wan_t2v = wan.WanT2V(
     use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
     t5_cpu=args.t5_cpu
 )
+
+
 
 vae = WanVAE(
     z_dim=16,  # Matches your latent shape [16, 1, 60, 104]
