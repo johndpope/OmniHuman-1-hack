@@ -6,6 +6,9 @@ from PIL import Image
 import argparse
 import os
 from logger import logger
+import wan
+from wan.configs import WAN_CONFIGS
+
 
 # Install these dependencies if not already present
 try:
@@ -56,13 +59,19 @@ positive_contexts = [c.to(device) for c in data_dict["positive_contexts"][:num_s
 dummy_prompts = data_dict["dummy_prompts"][:num_samples]
 v_teacher = data_dict["v_teacher"][:num_samples].to(device)
 
+rank = 0  
 # Load WanT2V and VAE
-wan_t2v = WanT2V(
+wan_t2v = wan.WanT2V(
+    config=config,
     checkpoint_dir=args.checkpoint_dir,
     device_id=0,
-    rank=0,
-    t5_cpu=False  # Adjust based on your setup
-).to(device)
+    rank=rank,
+    t5_fsdp=args.t5_fsdp,
+    dit_fsdp=args.dit_fsdp,
+    use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+    t5_cpu=args.t5_cpu
+)
+
 vae = WanVAE(
     z_dim=16,  # Matches your latent shape [16, 1, 60, 104]
     vae_pth=args.vae_path,
