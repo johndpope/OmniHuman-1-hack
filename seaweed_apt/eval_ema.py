@@ -39,6 +39,7 @@ parser.add_argument("--dit_fsdp", action="store_true", default=False, help="Whet
 parser.add_argument("--ulysses_size", type=int, default=1, help="The size of the ulysses parallelism in DiT.")
 parser.add_argument("--t5_fsdp", action="store_true", default=False, help="Whether to use FSDP for T5.")
 parser.add_argument("--ring_size", type=int, default=1, help="The size of the ring attention parallelism in DiT.")
+parser.add_argument("--num_samples", type=int, default=10, help="Number of samples to evaluate")
 args = parser.parse_args()
 
 # Setup
@@ -80,19 +81,79 @@ wan_t2v = wan.WanT2V(
 )
 
 
-
-vae = WanVAE(
-    z_dim=16,  # Matches your latent shape [16, 1, 60, 104]
-    vae_pth=args.vae_path,
-    dtype=torch.float32,
-    device=device
-)
+logger.debug(f"Noise shape: {noise.shape}")
+logger.debug(f"v_teacher shape: {v_teacher.shape}")
+logger.debug(f"Number of positive contexts: {len(positive_contexts)}")
+logger.debug(f"First positive context shape: {positive_contexts[0].shape}")
 
 # Generate EMA outputs
+logger.info("Generating outputs from EMA model...")
+x_latent_list = []
 with torch.no_grad():
-    x_latent = ema_model(noise, t=torch.zeros(num_samples, device=device), context=positive_contexts, seq_len=1560)
-    x_pixel = vae.decode([x.squeeze(2) for x in x_latent.chunk(num_samples)])  # [10, C, T, H, W] -> [10, T, H, W, 3]
-    x_pixel = torch.stack(x_pixel).cpu().numpy()  # [10, T, 480, 832, 3], range [-1, 1]
+    for i in range(num_samples):
+        # Process one sample at a time to avoid OOM issues
+        sample_noise = noise[i:i+1]
+        sample_context = [positive_contexts[i]]
+        logger.debug(f"Processing sample {i+1}/{num_samples}")
+        logger.debug(f"Sample noise shape: {sample_noise.shape}")
+        logger.debug(f"Sample context shape: {sample_context[0].shape}")
+        
+        # Get prediction from EMA model - use the same sequence length as in generate_batch
+        seq_len = 1560  # This should match what was used in generate_batch
+        sample_output = ema_model(sample_noise, t=torch.zeros(1, device=device), context=sample_context, seq_len=seq_len)
+        
+        if isinstance(sample_output, list):
+            # Handle case where output is a list of tensors
+           
+            logger.debug(f"Output is a list of {len(sample_output)} tensors")
+            for j, tensor in enumerate(sample_output):
+                logger.debug(f"  Output tensor {j} shape: {tensor.shape}")
+            sample_output = sample_output[0]  # Take first element if it's a list
+        
+        logger.debug(f"Sample output shape: {sample_output.shape}")
+        
+        x_latent_list.append(sample_output.cpu())
+
+# Stack all latent outputs
+x_latent = torch.cat(x_latent_list, dim=0).to(device)
+logger.info(f"Generated EMA outputs with shape: {x_latent.shape}")
+
+# Decode latents to pixel space
+logger.info("Decoding latents to pixel space...")
+try:
+    # Reshape latent if needed
+    if len(x_latent.shape) == 5 and x_latent.shape[2] == 1:  # [B, C, 1, H, W]
+        x_latent = x_latent.squeeze(2)  # [B, C, H, W]
+    
+    logger.debug(f"Latent shape before decoding: {x_latent.shape}")
+    
+    # Decode latents to pixel space
+    x_pixel_list = []
+    for i in range(num_samples):
+        # Process one sample at a time
+        sample_latent = x_latent[i:i+1]
+        sample_pixel = wan_t2v.vae.decode(sample_latent)
+        
+        if isinstance(sample_pixel, list):
+            sample_pixel = sample_pixel[0]  # Take first element if it's a list
+        
+        logger.debug(f"Sample {i} pixel shape: {sample_pixel.shape}")
+        
+        x_pixel_list.append(sample_pixel.cpu())
+    
+    # Stack all pixel outputs
+    x_pixel = torch.stack(x_pixel_list).numpy()  # [N, T, H, W, 3] or [N, H, W, 3]
+    
+    logger.debug(f"Final pixel shape: {x_pixel.shape}")
+    
+    logger.info(f"Decoded latents to pixel space with shape: {x_pixel.shape}")
+except Exception as e:
+    logger.error(f"Error decoding latents: {e}")
+    import traceback
+    traceback.print_exc()
+    logger.info("Continuing with evaluation...")
+    x_pixel = None
+
 
 # 1. FVD - Compare to real videos
 def load_real_videos(directory, num_samples, shape=(16, 480, 832, 3)):
