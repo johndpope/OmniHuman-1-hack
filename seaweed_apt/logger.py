@@ -1,3 +1,4 @@
+# Copyright 2024-2025 @johndpope All rights reserved.
 import logging
 from rich.logging import RichHandler
 import warnings

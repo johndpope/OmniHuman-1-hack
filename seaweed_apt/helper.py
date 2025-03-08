@@ -1,4 +1,4 @@
-
+# Copyright 2024-2025 @johndpope All rights reserved.
 import asyncio
 import websockets
 import json

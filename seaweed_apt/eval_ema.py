@@ -73,81 +73,79 @@ wan_t2v = wan.WanT2V(
     use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
     t5_cpu=args.t5_cpu
 )
-
-
 logger.debug(f"Noise shape: {noise.shape}")
 logger.debug(f"v_teacher shape: {v_teacher.shape}")
 logger.debug(f"Number of positive contexts: {len(positive_contexts)}")
 logger.debug(f"First positive context shape: {positive_contexts[0].shape}")
 
+# Compute sequence length
+patch_size = wan_t2v.model.patch_size
+vae_stride = wan_t2v.vae_stride
+target_shape = (16, 1, 480 // vae_stride[1], 832 // vae_stride[2])  # [16, 1, 60, 104]
+seq_len = (target_shape[1] // patch_size[0]) * \
+          (target_shape[2] // patch_size[1]) * \
+          (target_shape[3] // patch_size[2])  # Should be 1560
+logger.info(f"Computed seq_len: {seq_len}")
+
 # Generate EMA outputs
 logger.info("Generating outputs from EMA model...")
 x_latent_list = []
+final_timestep = config.num_train_timesteps  # Use final timestep (e.g., 1000) for one-step generation
+
 with torch.no_grad():
     for i in range(num_samples):
-        # Process one sample at a time to avoid OOM issues
-        sample_noise = noise[i:i+1]
-        sample_context = [positive_contexts[i]]
+        sample_noise = noise[i:i+1]  # [1, 16, 1, 60, 104]
+        sample_context = [positive_contexts[i]]  # List of [512, 4096]
+        t = torch.full((1,), final_timestep, device=device, dtype=torch.float32)
+        
         logger.debug(f"Processing sample {i+1}/{num_samples}")
         logger.debug(f"Sample noise shape: {sample_noise.shape}")
         logger.debug(f"Sample context shape: {sample_context[0].shape}")
         
-        # Get prediction from EMA model - use the same sequence length as in generate_batch
-        seq_len = 1560  # This should match what was used in generate_batch
-        sample_output = ema_model(sample_noise, t=torch.zeros(1, device=device), context=sample_context, seq_len=seq_len)
+        # One-step generation: v = model(z, T), x = z - v
+        v_pred = wan_t2v.model(sample_noise, t, sample_context, seq_len)[0]  # [16, 1, 60, 104]
+        sample_output = sample_noise - v_pred  # [1, 16, 1, 60, 104]
         
-        if isinstance(sample_output, list):
-            # Handle case where output is a list of tensors
-           
-            logger.debug(f"Output is a list of {len(sample_output)} tensors")
-            for j, tensor in enumerate(sample_output):
-                logger.debug(f"  Output tensor {j} shape: {tensor.shape}")
-            sample_output = sample_output[0]  # Take first element if it's a list
-        
+        logger.debug(f"v_pred shape: {v_pred.shape}")
         logger.debug(f"Sample output shape: {sample_output.shape}")
         
         x_latent_list.append(sample_output.cpu())
+        torch.cuda.empty_cache()
 
-# Stack all latent outputs
-x_latent = torch.cat(x_latent_list, dim=0).to(device)
-logger.info(f"Generated EMA outputs with shape: {x_latent.shape}")
+# Stack latents correctly
+x_latent = torch.cat(x_latent_list, dim=0).to(device)  # [10, 16, 1, 60, 104]
+logger.info(f"Generated EMA latent outputs with shape: {x_latent.shape}")
 
 # Decode latents to pixel space
 logger.info("Decoding latents to pixel space...")
 try:
-    # Reshape latent if needed
-    if len(x_latent.shape) == 5 and x_latent.shape[2] == 1:  # [B, C, 1, H, W]
-        x_latent = x_latent.squeeze(2)  # [B, C, H, W]
+    # Ensure VAE expects [B, C, T, H, W]
+    if x_latent.shape[2] == 1:  # [10, 16, 1, 60, 104]
+        logger.warning("Latent has T=1; generating single-frame videos. Multi-frame generation may require noise adjustment.")
     
-    logger.debug(f"Latent shape before decoding: {x_latent.shape}")
+    # Decode each sample's latent to pixel space
+    x_pixel_list = wan_t2v.vae.decode([x.squeeze(0) for x in x_latent.chunk(num_samples)])  # List of [C, T, H, W]
     
-    # Decode latents to pixel space
-    x_pixel_list = []
-    for i in range(num_samples):
-        # Process one sample at a time
-        sample_latent = x_latent[i:i+1]
-        sample_pixel = wan_t2v.vae.decode(sample_latent)
-        
-        if isinstance(sample_pixel, list):
-            sample_pixel = sample_pixel[0]  # Take first element if it's a list
-        
-        logger.debug(f"Sample {i} pixel shape: {sample_pixel.shape}")
-        
-        x_pixel_list.append(sample_pixel.cpu())
-    
-    # Stack all pixel outputs
-    x_pixel = torch.stack(x_pixel_list).numpy()  # [N, T, H, W, 3] or [N, H, W, 3]
-    
-    logger.debug(f"Final pixel shape: {x_pixel.shape}")
-    
+    # Move to CPU and convert to NumPy
+    x_pixel = torch.stack(x_pixel_list).cpu().numpy()  # [10, 3, T, 480, 832]
     logger.info(f"Decoded latents to pixel space with shape: {x_pixel.shape}")
 except Exception as e:
     logger.error(f"Error decoding latents: {e}")
     import traceback
     traceback.print_exc()
-    logger.info("Continuing with evaluation...")
-    x_pixel = None
+    raise  # Re-raise the exception to halt execution and debug properly
 
+# Save Generated Videos
+if x_pixel is not None:  # This check is redundant now but kept for clarity
+    os.makedirs("eval_videos", exist_ok=True)
+    for i, video in enumerate(x_pixel):
+        # Normalize from [-1, 1] to [0, 255] and adjust axes
+        video_uint8 = ((video.transpose(1, 2, 3, 0) + 1) / 2 * 255).astype(np.uint8)  # [T, H, W, 3]
+        output_path = f"eval_videos/eval_video_{i}.mp4"
+        imageio.mimwrite(output_path, video_uint8, fps=16)  # Adjust fps as needed
+        logger.info(f"Saved video {i} to {output_path}")
+else:
+    logger.error("No videos generated due to decoding failure.")
 
 # 1. FVD - Compare to real videos
 # def load_real_videos(directory, num_samples, shape=(16, 480, 832, 3)):
