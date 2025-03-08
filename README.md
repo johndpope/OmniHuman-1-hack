@@ -45,6 +45,9 @@ v_teacher = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond
 
 
 ```shell
+# need this for WANPipeline - WAN2.1 hasn't been released yet ...
+pip install git+https://github.com/huggingface/diffusers
+
 # ~ 18GB https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/main
 pip install "huggingface_hub[cli]"
 # huggingface-cli download Wan-AI/I2V-14B-480P --local-dir ./models/I2V-14B-480P

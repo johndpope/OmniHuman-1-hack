@@ -140,53 +140,9 @@ RANDOM_PROMPTS = [
     "A whimsical train journey through a land of candy",
 ]
 
-def generate_batch(config, args, num_samples=100):
-    rank = 0
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.debug(f"Using device: {device}")
+def generate_batch(wan_t2v, num_samples=100):
 
-    if not hasattr(config, 'text_len'):
-        config.text_len = 512
-        logger.warning("Config missing 'text_len'. Defaulting to 512.")
 
-    # Initialize full WanT2V object
-    wan_t2v = wan.WanT2V(
-        config=config,
-        checkpoint_dir=args.checkpoint_dir,
-        device_id=0,
-        rank=rank,
-        t5_fsdp=args.t5_fsdp,
-        dit_fsdp=args.dit_fsdp,
-        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
-        t5_cpu=args.t5_cpu
-    )
-
-    # Set up diffusers components
-    try:
-        from diffusers import FlowMatchEulerDiscreteScheduler, WanPipeline
-        
-        # Create scheduler
-        scheduler = FlowMatchEulerDiscreteScheduler(
-            num_train_timesteps=config.num_train_timesteps,
-            shift=1.0,
-        )
-        
-        # Initialize pipeline
-        pipe = WanPipeline(
-            tokenizer=wan_t2v.text_encoder.tokenizer,
-            text_encoder=wan_t2v.text_encoder.model,
-            transformer=wan_t2v.model,
-            vae=wan_t2v.vae.model,
-            scheduler=scheduler
-        )
-        
-        # Move to device
-        pipe = pipe.to(device)
-        diffusers_available = True
-        logger.info("Successfully initialized diffusers pipeline")
-    except Exception as e:
-        diffusers_available = False
-        logger.warning(f"Could not initialize diffusers pipeline: {e}")
 
     dummy_prompts = RANDOM_PROMPTS[:num_samples]
     base_seed = random.randint(0, sys.maxsize) if not hasattr(config, 'base_seed') else config.base_seed
@@ -204,6 +160,16 @@ def generate_batch(config, args, num_samples=100):
               (target_shape[3] // patch_size[2])
     logger.info(f"Computed seq_len: {seq_len}")
 
+
+        # Why [16, 1, 60, 104]?
+        # It’s the latent shape for one frame of a 480x832 video after VAE encoding with stride [4, 8, 8]:
+        # 16: Latent channels (z_dim).
+        # 60: Height ( 480÷8).
+        # 104: Width (832÷8).
+        # 1: Single temporal frame, with full sequence (e.g., 4 frames from 16) handled by the model or decoding.
+        # What’s the 1 for?
+        # It’s the temporal dimension, set to 1 to generate noise for a single latent frame per sample. This aligns with per-timestep diffusion (e.g., computing v_teacher at T-1), simplifying the batch to 100 independent frames rather than full videos.
+    
     # Precompute contexts
     logger.info("Preprocessing text contexts...")
     wan_t2v.text_encoder.model.to(device)
@@ -230,29 +196,21 @@ def generate_batch(config, args, num_samples=100):
     assert negative_context.shape == torch.Size([max_seq_len, 4096]), \
         f"Negative context shape mismatch: got {negative_context.shape}, expected [{max_seq_len}, 4096]"
 
-    # Generate noise, latents, and v_teacher, and also generate images
-    logger.info("Generating noise, latents, teacher predictions, and images...")
+    # Generate noise, dummy_data (latents), and v_teacher
+    logger.info("Generating noise, latents, and teacher predictions...")
     wan_t2v.model.to(device)
     noise_list = []
     dummy_data_list = []
     v_teacher_list = []
-    model_images = []
-    diffuser_images = []
     timestep = torch.tensor([wan_t2v.num_train_timesteps - 1], device=device, dtype=torch.float32)
     cfg_scale = 7.5
 
-    # Import required modules for image handling
-    import numpy as np
-    from PIL import Image
-    os.makedirs("generated_images", exist_ok=True)
-
+    # In generate.py, within generate_batch function
     for i in range(num_samples):
         seed = base_seed + i
         seed_g = torch.Generator(device=device)
         seed_g.manual_seed(seed)
-        prompt = dummy_prompts[i]
         
-        # Generate noise
         noise = torch.randn(
             target_shape,  # [16, 1, 60, 104]
             dtype=torch.float32,
@@ -265,64 +223,19 @@ def generate_batch(config, args, num_samples=100):
             context = positive_contexts[i].to(device)
             context_null = negative_context.to(device)
             noise_input = noise  # Shape: [16, 1, 60, 104]
-            
-            # Predict velocity field v at timestep T (teacher prediction)
+            # Predict velocity field v at timestep T
             noise_pred_cond = wan_t2v.model(noise_input.unsqueeze(0), t=timestep, context=[context], seq_len=seq_len)[0]
             noise_pred_uncond = wan_t2v.model(noise_input.unsqueeze(0), t=timestep, context=[context_null], seq_len=seq_len)[0]
             v_teacher = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)  # Velocity field
             dummy_data_list.append(noise.cpu())  # Store noise as input
             v_teacher_list.append(v_teacher.cpu())
-            
-            # Generate image using the model directly
-            model_output = noise - v_teacher
-            model_pixel = wan_t2v.vae.decode([model_output.squeeze(0)])
-            model_image = model_pixel[0][:, 0].permute(1, 2, 0).cpu().numpy()
-            model_image = ((model_image + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
-            model_images.append(model_image)
-            
-            # Save the model-generated image
-            Image.fromarray(model_image).save(f"generated_images/model_output_{i}.png")
-            
-            # If diffusers is available, generate image using the pipeline
-            if diffusers_available:
-                try:
-                    # Reset generator for consistency
-                    generator = torch.Generator(device=device).manual_seed(seed)
-                    
-                    # Run pipeline
-                    diffuser_output = pipe(
-                        prompt=prompt,
-                        negative_prompt=config.sample_neg_prompt,
-                        height=size[0], 
-                        width=size[1],
-                        num_frames=1,  # Just generate a single frame
-                        num_inference_steps=1,  # One-step generation
-                        guidance_scale=cfg_scale,
-                        generator=generator,
-                        output_type="np",
-                    )
-                    
-                    # Extract the generated image
-                    diffuser_image = diffuser_output.frames[0][0]  # First batch, first frame
-                    diffuser_images.append(diffuser_image)
-                    
-                    # Save the diffuser-generated image
-                    Image.fromarray((diffuser_image * 255).astype(np.uint8)).save(f"generated_images/diffuser_output_{i}.png")
-                    
-                except Exception as e:
-                    logger.error(f"Error generating with diffusers for prompt {i}: {e}")
-                    diffuser_images.append(None)
-            
-        # Clear CUDA cache to avoid memory issues
         torch.cuda.empty_cache()
-        
-        if (i+1) % 10 == 0:
-            logger.info(f"Processed {i+1}/{num_samples} samples")
 
     # Compile data dictionary with shape checks
     noise = torch.stack(noise_list, dim=0)            # Shape: [100, 16, 1, 60, 104]
     dummy_data = torch.stack(dummy_data_list, dim=0)  # Shape: [100, 16, 1, 60, 104]
     v_teacher = torch.stack(v_teacher_list, dim=0)    # Shape: [100, 16, 1, 60, 104]
+    
     
     assert dummy_data.shape == torch.Size([num_samples, 16, 1, 60, 104]), \
         f"dummy_data shape mismatch: got {dummy_data.shape}, expected [{num_samples}, 16, 1, 60, 104]"
@@ -332,57 +245,28 @@ def generate_batch(config, args, num_samples=100):
         f"v_teacher shape mismatch: got {v_teacher.shape}, expected [{num_samples}, 16, 1, 60, 104]"
     assert len(positive_contexts) == num_samples, \
         f"positive_contexts length mismatch: got {len(positive_contexts)}, expected {num_samples}"
-    
     data_dict = {
         "dummy_data": dummy_data,
         "noise": noise,
         "dummy_prompts": dummy_prompts,
         "positive_contexts": positive_contexts,
         "negative_context": negative_context,
-        "v_teacher": v_teacher,
-        "model_images": model_images
+        "v_teacher": v_teacher
     }
-    
-    # Add diffuser images if available
-    if diffusers_available:
-        data_dict["diffuser_images"] = diffuser_images
-    
-    # Create a grid of sample images
-    if len(model_images) > 0:
-        try:
-            from matplotlib import pyplot as plt
-            
-            # Create a grid of the first few images
-            num_display = min(5, len(model_images))
-            fig, axes = plt.subplots(num_display, 1, figsize=(12, 4*num_display))
-            
-            for i in range(num_display):
-                if num_display == 1:
-                    ax = axes
-                else:
-                    ax = axes[i]
-                    
-                ax.imshow(model_images[i])
-                ax.set_title(f"Prompt: {dummy_prompts[i]}")
-                ax.axis('off')
-            
-            plt.tight_layout()
-            plt.savefig("sample_grid.png")
-            logger.info("Saved sample grid to sample_grid.png")
-        except Exception as e:
-            logger.warning(f"Failed to create sample grid: {e}")
-    
+
     filename = f"dummy_data_{size[0]}x{size[1]}.pt"
     torch.save(data_dict, filename)
     logger.info(f"Generated and saved data_dict to {filename} with keys: {data_dict.keys()}")
     logger.info(f"Shape checks: dummy_data={dummy_data.shape}, noise={noise.shape}, "
                 f"positive_contexts[0]={positive_contexts[0].shape}, negative_context={negative_context.shape}, "
                 f"v_teacher={v_teacher.shape}")
-    logger.info(f"Generated {len(model_images)} model images")
-    if diffusers_available:
-        logger.info(f"Generated {sum(1 for x in diffuser_images if x is not None)} diffuser images")
 
+    visualize_and_save_batch_with_vae(data_dict, wan_t2v)
+
+
+    
     return data_dict
+
 def create_dataloader(data_path, batch_size=1):
     dataset = TextVideoDataset(data_path)
     def custom_collate(batch):
@@ -478,6 +362,82 @@ def visualize_and_save_batch_with_vae(data_dict, wan_t2v, filename="sample_visua
     return x0_img
 
 
+def test_diffusers_pipeline(wan_t2v, prompt="A beautiful landscape with mountains and a lake", size=(480, 832), cfg_scale=7.5, seed=42):
+    """
+    Standalone function to test the model with diffusers pipeline using a single dummy prompt.
+    
+    Args:
+        wan_t2v: The WanT2V model
+        prompt: Text prompt to use
+        size: Output image size (height, width)
+        cfg_scale: Classifier-free guidance scale
+        seed: Random seed for reproducibility
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    import os
+    import torch
+    import numpy as np
+    from PIL import Image
+    
+    device = wan_t2v.device
+    logger.info(f"Testing diffusers pipeline with prompt: '{prompt}'")
+    
+    try:
+        # Import diffusers components
+        from diffusers import FlowMatchEulerDiscreteScheduler, WanPipeline
+        
+        # Create scheduler
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=wan_t2v.num_train_timesteps,
+            shift=1.0,
+        )
+        
+        # Initialize pipeline
+        pipe = WanPipeline(
+            tokenizer=wan_t2v.text_encoder.tokenizer,
+            text_encoder=wan_t2v.text_encoder.model,
+            transformer=wan_t2v.model,
+            vae=wan_t2v.vae.model,
+            scheduler=scheduler
+        )
+        
+        # Move to device
+        pipe = pipe.to(device)
+        logger.info("Successfully initialized diffusers pipeline")
+        
+        # Set seed for reproducibility
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
+        # Run pipeline
+        logger.info("Running diffusers pipeline...")
+        output = pipe(
+            prompt=prompt,
+            negative_prompt=wan_t2v.sample_neg_prompt,
+            height=size[0], 
+            width=size[1],
+            num_frames=1,  # Just generate a single frame
+            num_inference_steps=1,  # One-step generation
+            guidance_scale=cfg_scale,
+            generator=generator,
+            output_type="np",
+        )
+        
+        # Extract and save the generated image
+        image = output.frames[0][0]  # First batch, first frame
+        os.makedirs("test_outputs", exist_ok=True)
+        Image.fromarray((image * 255).astype(np.uint8)).save("test_outputs/diffusers_test.png")
+        logger.info("Successfully generated and saved image to test_outputs/diffusers_test.png")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error testing diffusers pipeline: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 
 # [INFO] Creating WanT2V pipeline.
@@ -515,12 +475,36 @@ if __name__ == "__main__":
     parser.add_argument("--t5_fsdp", action="store_true", default=False, help="Whether to use FSDP for T5.")
     args = parser.parse_args()
     
+
     from wan.configs import t2v_14B, t2v_1_3B
-    data_dict = generate_batch(t2v_1_3B, args,num_samples=100)
-    
+    config = t2v_1_3B
+    if not hasattr(config, 'text_len'):
+        config.text_len = 512
+        logger.warning("Config missing 'text_len'. Defaulting to 512.")
+
+    # Initialize full WanT2V object
+    wan_t2v = wan.WanT2V(
+        config=config,
+        checkpoint_dir=args.checkpoint_dir,
+        device_id=0,
+        rank=0,
+        t5_fsdp=args.t5_fsdp,
+        dit_fsdp=args.dit_fsdp,
+        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+        t5_cpu=args.t5_cpu
+    )
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.debug(f"Using device: {device}")
+
+    logger.info("Preprocessing text contexts...")
+    wan_t2v.text_encoder.model.to(device)
+
+    data_dict = generate_batch(wan_t2v, args,num_samples=100)
+    # test_diffusers_pipeline(wan_t2v, prompt="A beautiful landscape with mountains and a lake", size=(480, 832), cfg_scale=7.5, seed=42)
+   
     
     # Call this function at the end of generate_batch
-    visualize_and_save_batch(data_dict)
+    visualize_and_save_batch_with_vae(data_dict)
 
     success = test_dataset()
     if success:
