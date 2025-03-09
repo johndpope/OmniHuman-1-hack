@@ -49,7 +49,7 @@ class OmniHumanTrainer:
         self.config = config
         
         # Setup output directory
-        self.output_dir = Path(output_dir or config.get("output_dir", "outputs"))
+        self.output_dir = Path(output_dir or config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Save config
@@ -57,9 +57,9 @@ class OmniHumanTrainer:
         
         # Initialize accelerator
         self.accelerator = Accelerator(
-            gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
-            mixed_precision=config.get("mixed_precision", "no"),
-            log_with="wandb" if config.get("use_wandb", False) else None
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            mixed_precision=config.mixed_precision,
+            log_with="wandb" if config.use_wandb else None
         )
         
         self.is_main_process = self.accelerator.is_main_process
@@ -76,36 +76,36 @@ class OmniHumanTrainer:
         )
         
         # Set random seed for reproducibility
-        set_seed(config.get("seed", 42))
+        set_seed(config.seed)
         
         logger.info(f"Initialized OmniHumanTrainer with config: {OmegaConf.to_yaml(config)}")
-        
+    
     def setup_optimizers(self):
         """Initialize optimizer and learning rate scheduler."""
         # Get optimizer parameters
-        optimizer_cls = getattr(torch.optim, self.config.get("optimizer_type", "AdamW"))
+        optimizer_cls = getattr(torch.optim, self.config.optimizer_type)
         self.optimizer = optimizer_cls(
             self.model.parameters(),
-            lr=self.config.get("learning_rate", 1e-4),
-            weight_decay=self.config.get("weight_decay", 0.01),
-            betas=(self.config.get("beta1", 0.9), self.config.get("beta2", 0.999))
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+            betas=(self.config.beta1, self.config.beta2)
         )
         
         # Get scheduler parameters
-        total_steps = self.config.get("total_steps", 100000)
-        scheduler_type = self.config.get("scheduler_type", "cosine")
+        total_steps = self.config.total_steps
+        scheduler_type = self.config.scheduler_type
         
         if scheduler_type == "cosine":
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=total_steps,
-                eta_min=self.config.get("min_lr", 1e-6)
+                eta_min=self.config.min_lr
             )
         elif scheduler_type == "linear":
             self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
                 self.optimizer,
                 start_factor=1.0,
-                end_factor=self.config.get("end_factor", 0.1),
+                end_factor=self.config.end_factor,
                 total_iters=total_steps
             )
         elif scheduler_type == "constant":
@@ -119,7 +119,7 @@ class OmniHumanTrainer:
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=total_steps,
-                eta_min=self.config.get("min_lr", 1e-6)
+                eta_min=self.config.min_lr
             )
         
         logger.info(f"Setup optimizer {optimizer_cls.__name__} with scheduler {scheduler_type}")
@@ -129,20 +129,20 @@ class OmniHumanTrainer:
         if self.is_main_process:
            
             # Initialize W&B if enabled
-            if self.config.get("use_wandb", False):
-                run_name = self.config.get("run_name", None)
+            if self.config.use_wandb:
+                run_name = self.config.run_name
                 if run_name is None:
-                    run_name = f"omnihuman-{self.config.get('model_type', 'default')}-{wandb.util.generate_id()}"
+                    run_name = f"omnihuman-{self.config.model_type}-{wandb.util.generate_id()}"
                 
                 self.accelerator.init_trackers(
-                    project_name=self.config.get("wandb_project", "OmniHuman"),
+                    project_name=self.config.wandb_project,
                     config=OmegaConf.to_container(self.config, resolve=True),
                     init_kwargs={
                         "wandb": {
                             "name": run_name,
                             "dir": str(self.output_dir),
-                            "group": self.config.get("wandb_group", None),
-                            "tags": self.config.get("wandb_tags", []),
+                            "group": self.config.wandb_group,
+                            "tags": self.config.wandb_tags,
                         }
                     }
                 )
@@ -218,36 +218,31 @@ class OmniHumanTrainer:
         log_str += " | " + " | ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()])
         logger.info(log_str)
     
-    def prepare_dataset(self, stage_config: DictConfig, dataset_cls: type):
+    def prepare_dataset(self, stage_config: DictConfig):
         """Prepare dataset with the appropriate condition ratios.
         
         Args:
             stage_config: Configuration for the current stage
-            dataset_cls: Dataset class to use
             
         Returns:
             Configured DataLoader
         """
         # Get condition ratios for this stage
-        condition_ratios = stage_config.get("condition_ratios", {})
+        condition_ratios = stage_config.condition_ratios
         logger.info(f"Preparing dataset with condition ratios: {condition_ratios}")
         
-        # Create dataset
-        dataset = dataset_cls(
-            data_dir=self.config.data.get("data_dir"),
-            condition_ratios=condition_ratios,
-            num_frames=self.config.get("num_frames", 49),
-            num_keypoints=self.config.get("num_keypoints", 308),  # Sapiens 308 keypoints
-            heatmap_size=self.config.data.get("heatmap_size", (64, 64)),
-            frame_size=self.config.data.get("frame_size", (256, 256))
+        # Create dataset with config and condition ratios
+        dataset = OmniHumanDataset(
+            config=self.config,
+            condition_ratios=condition_ratios
         )
         
         # Create dataloader
         dataloader = DataLoader(
             dataset,
-            batch_size=self.config.get("batch_size", 4),
+            batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=self.config.get("num_workers", 4),
+            num_workers=self.config.num_workers,
             pin_memory=True,
             drop_last=True
         )
@@ -319,7 +314,7 @@ class OmniHumanTrainer:
                     if self.accelerator.sync_gradients:
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), 
-                            self.config.get("max_grad_norm", 1.0)
+                            self.config.max_grad_norm
                         )
                     
                     self.optimizer.step()
@@ -331,7 +326,7 @@ class OmniHumanTrainer:
                 num_batches += 1
                 
                 # Log metrics at specified intervals
-                if step % self.config.get("log_interval", 100) == 0:
+                if step % self.config.log_interval == 0:
                     avg_loss = accumulated_loss / max(num_batches, 1)
                     metrics = {
                         "loss": avg_loss,
@@ -343,7 +338,7 @@ class OmniHumanTrainer:
                     num_batches = 0
                 
                 # Save checkpoint at specified intervals
-                if step % self.config.get("checkpoint_interval", 1000) == 0:
+                if step % self.config.checkpoint_interval == 0:
                     self.save_checkpoint(step, stage)
                 
                 # Update progress bar
@@ -355,19 +350,15 @@ class OmniHumanTrainer:
                     break
         
         # Save final checkpoint for this stage
-        self.save_checkpoint(step, stage, is_final=(stage == self.config.get("num_stages", 3)))
+        self.save_checkpoint(step, stage, is_final=(stage == len(self.config.stages)))
         logger.info(f"Completed training stage {stage}")
     
-    def train(self, dataset_cls: type):
-        """Execute complete training process with all stages per OmniHuman spec.
-        
-        Args:
-            dataset_cls: Dataset class to use
-        """
+    def train(self):
+        """Execute complete training process with all stages per OmniHuman spec."""
         logger.info("Starting OmniHuman training")
         
         # Get stage configurations
-        stages = self.config.get("stages", [])
+        stages = self.config.stages
         num_stages = len(stages)
         
         if num_stages == 0:
@@ -380,12 +371,12 @@ class OmniHumanTrainer:
             stage_num = stage_idx + 1
             logger.info(f"Preparing stage {stage_num}/{num_stages}")
             
-            # Get condition ratios for this stage
-            condition_ratios = stage_config.get("condition_ratios", {})
-            num_steps = stage_config.get("num_steps", 10000)
+            # Get condition ratios and steps for this stage
+            condition_ratios = stage_config.condition_ratios
+            num_steps = stage_config.num_steps
             
             # Create dataset and dataloader for this stage
-            dataloader = self.prepare_dataset(stage_config, dataset_cls)
+            dataloader = self.prepare_dataset(stage_config)
             
             # Train for this stage
             self.train_stage(
@@ -398,7 +389,7 @@ class OmniHumanTrainer:
         logger.info("Training completed")
         
         # Final cleanup
-        if self.config.get("use_wandb", False) and self.is_main_process:
+        if self.config.use_wandb and self.is_main_process:
             wandb.finish()
 
 
@@ -507,7 +498,7 @@ def main():
         
         # Start training
         logger.info("Starting training")
-        trainer.train(OmniHumanDataset)
+        trainer.train()
         
     elif args.mode == "inference":
         if not args.checkpoint:

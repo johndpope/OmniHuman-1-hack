@@ -25,96 +25,55 @@ from accelerate.utils import set_seed
 import wandb
 from keypoint_processor import SapiensKeypointProcessor
 
-
 class OmniHumanDataset(Dataset):
     """Dataset for OmniHuman training with Sapiens 308 keypoints and mixed condition support."""
     
     def __init__(
         self,
-        data_dir: str,
-        condition_ratios: Dict[str, float],
-        num_frames: int = 49,
-        frame_size: Tuple[int, int] = (256, 256),
-        num_keypoints: int = 308,  # Sapiens 308 keypoints
-        heatmap_size: Tuple[int, int] = (64, 64),
-        sigma: float = 2.0,
-        transform: Optional[T.Compose] = None,
-        audio_sampling_rate: int = 16000,
-        audio_features_dim: int = 1024,
-        min_quality_score: float = 0.7,
-        min_motion_score: float = 0.5,
-        sapiens_checkpoints_dir: Optional[str] = None,
-        sapiens_model_name: str = "1b",
-        sapiens_detection_config: Optional[str] = None,
-        sapiens_detection_checkpoint: Optional[str] = None,
+        config: DictConfig,
+        condition_ratios: Dict[str, float]
     ):
         """Initialize the OmniHuman dataset.
         
         Args:
-            data_dir: Directory containing the dataset
+            config: Configuration dictionary containing dataset parameters
             condition_ratios: Ratios for different condition modalities
-            num_frames: Number of frames to sample
-            frame_size: Size of output frames
-            num_keypoints: Number of pose keypoints (308 for Sapiens)
-            heatmap_size: Size of pose heatmaps
-            sigma: Sigma for Gaussian heatmaps
-            transform: Optional transform to apply to frames
-            audio_sampling_rate: Audio sampling rate
-            audio_features_dim: Dimensionality of audio features
-            min_quality_score: Minimum quality score for data filtering
-            min_motion_score: Minimum motion score for data filtering
-            sapiens_checkpoints_dir: Directory containing Sapiens checkpoints
-            sapiens_model_name: Sapiens model size to use
-            sapiens_detection_config: Path to detection config file
-            sapiens_detection_checkpoint: Path to detection checkpoint file
         """
         super().__init__()
-        self.data_dir = Path(data_dir)
+        
+        # Extract parameters from config
+        data_config = config.data
+        
+        # Dataset location and properties
+        self.data_dir = Path(data_config.data_dir)
         self.condition_ratios = condition_ratios
-        self.num_frames = num_frames
-        self.frame_size = frame_size
-        self.num_keypoints = num_keypoints
-        self.heatmap_size = heatmap_size
-        self.sigma = sigma
-        self.audio_sampling_rate = audio_sampling_rate
-        self.audio_features_dim = audio_features_dim
-        self.min_quality_score = min_quality_score
-        self.min_motion_score = min_motion_score
+        self.num_frames = config.num_frames
+        self.frame_size = data_config.frame_size
+        self.num_keypoints = config.num_keypoints
+        self.heatmap_size = data_config.heatmap_size
+        self.sigma = data_config.get('sigma', 2.0)
+        
+        # Audio settings
+        self.audio_sampling_rate = data_config.get('audio_sampling_rate', 16000)
+        self.audio_features_dim = data_config.get('audio_features_dim', 1024)
+        
+        # Quality thresholds
+        self.min_quality_score = data_config.get('min_quality_score', 0.7)
+        self.min_motion_score = data_config.get('min_motion_score', 0.5)
+        
+        # Keypoint processor settings
+        sapiens_config = config.get('sapiens', {})
+        self.sapiens_checkpoints_dir = sapiens_config.get('checkpoints_dir')
+        self.sapiens_model_name = sapiens_config.get('model_name', '1b')
+        self.sapiens_detection_config = sapiens_config.get('detection_config')
+        self.sapiens_detection_checkpoint = sapiens_config.get('detection_checkpoint')
         
         # Setup transforms for frames
-        if transform is None:
-            self.transform = T.Compose([
-                T.Resize(frame_size),
-                T.RandomHorizontalFlip(),
-                T.ToTensor(),
-                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-            ])
-        else:
-            self.transform = transform
+        self.transform = self._setup_transforms(data_config)
+        self.reference_transform = self._setup_reference_transforms(data_config)
             
-        # Setup transform for reference image (no random flip to maintain consistency)
-        self.reference_transform = T.Compose([
-            T.Resize(frame_size),
-            T.ToTensor(),
-            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
-        
         # Initialize Sapiens keypoint processor if checkpoints directory is provided
-        self.keypoint_processor = None
-        if sapiens_checkpoints_dir:
-            try:
-                self.keypoint_processor = SapiensKeypointProcessor(
-                    checkpoints_dir=sapiens_checkpoints_dir,
-                    model_name=sapiens_model_name,
-                    detection_config=sapiens_detection_config,
-                    detection_checkpoint=sapiens_detection_checkpoint,
-                    heatmap_size=heatmap_size,
-                )
-                logger.info(f"Initialized Sapiens keypoint processor with model {sapiens_model_name}")
-            except Exception as e:
-                logger.error(f"Failed to initialize Sapiens keypoint processor: {e}")
-        else:
-            logger.warning("No Sapiens checkpoints directory provided, pose extraction will not be available")
+        self.keypoint_processor = self._init_keypoint_processor()
             
         # Load dataset annotations
         self.annotations = self._load_annotations()
@@ -123,7 +82,51 @@ class OmniHumanDataset(Dataset):
         self.filtered_data = self._filter_data()
         
         logger.info(f"Loaded dataset with {len(self.filtered_data)} samples")
-        
+    
+    def _setup_transforms(self, data_config: DictConfig) -> T.Compose:
+        """Set up image transforms based on config."""
+        if hasattr(data_config, 'transform') and data_config.transform:
+            # Use custom transform from config if provided
+            return data_config.transform
+        else:
+            # Use default transform
+            return T.Compose([
+                T.Resize(self.frame_size),
+                T.RandomHorizontalFlip(),
+                T.ToTensor(),
+                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            ])
+    
+    def _setup_reference_transforms(self, data_config: DictConfig) -> T.Compose:
+        """Set up reference image transforms based on config."""
+        # No random flip for reference to maintain consistency
+        return T.Compose([
+            T.Resize(self.frame_size),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+    
+    def _init_keypoint_processor(self) -> Optional[SapiensKeypointProcessor]:
+        """Initialize Sapiens keypoint processor."""
+        if self.sapiens_checkpoints_dir:
+            try:
+                processor = SapiensKeypointProcessor(
+                    checkpoints_dir=self.sapiens_checkpoints_dir,
+                    model_name=self.sapiens_model_name,
+                    detection_config=self.sapiens_detection_config,
+                    detection_checkpoint=self.sapiens_detection_checkpoint,
+                    heatmap_size=self.heatmap_size,
+                )
+                logger.info(f"Initialized Sapiens keypoint processor with model {self.sapiens_model_name}")
+                return processor
+            except Exception as e:
+                logger.error(f"Failed to initialize Sapiens keypoint processor: {e}")
+                return None
+        else:
+            logger.warning("No Sapiens checkpoints directory provided, pose extraction will not be available")
+            return None
+
+            
     def _load_annotations(self) -> List[Dict]:
         """Load dataset annotations."""
         annotation_file = self.data_dir / 'annotations.json'
