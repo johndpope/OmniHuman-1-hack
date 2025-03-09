@@ -18,7 +18,7 @@ audio_dim: 1024
 negative_prompt: ""
 latent_height: 64
 latent_width: 64
-checkpoint_dir: "./checkpoints/want2v"
+checkpoint_dir: "../models/Wan2.1-T2V-1.3B"
 
 # Training configuration
 learning_rate: 1e-4

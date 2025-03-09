@@ -1,3 +1,4 @@
+from logger import logger
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple
@@ -7,7 +8,6 @@ from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae import WanVAE
 from wan.configs import t2v_14B  # Example config, adjust as needed
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler
-from logger import logger
 from omegaconf import DictConfig, OmegaConf
 
 class OmniConditionsModule(nn.Module):

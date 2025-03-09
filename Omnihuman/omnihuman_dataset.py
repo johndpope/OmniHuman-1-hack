@@ -1,4 +1,4 @@
-
+from logger import logger
 import os
 import json
 import math
@@ -23,7 +23,6 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 import wandb
-from logger import logger
 from keypoint_processor import SapiensKeypointProcessor
 
 

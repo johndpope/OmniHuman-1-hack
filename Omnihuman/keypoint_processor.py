@@ -1,3 +1,4 @@
+from logger import logger
 import os
 import torch
 import numpy as np
@@ -8,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 
-from logger import logger
+
 
 
 # https://raw.githubusercontent.com/johndpope/EAI/refs/heads/main/pose_vis.py
