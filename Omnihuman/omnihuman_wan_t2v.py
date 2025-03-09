@@ -167,27 +167,15 @@ class OmniHumanWanT2V(nn.Module):
         
     def _init_diffusion_scheduler(self):
         """Initialize the diffusion scheduler."""
-        # Import here to avoid circular dependencies
-        try:
-            from diffusers import DPMSolverMultistepScheduler
-            self.scheduler = DPMSolverMultistepScheduler(
-                num_train_timesteps=1000,
-                solver_order=2,
-                prediction_type="v_prediction",
-                beta_schedule="linear",
-                clip_sample=False
-            )
-            logger.info("Using DPMSolverMultistepScheduler from diffusers")
-        except ImportError:
-            # Fallback to custom scheduler if diffusers is not available
-            from utils.fm_solvers import FlowDPMSolverMultistepScheduler
-            self.scheduler = FlowDPMSolverMultistepScheduler(
-                num_train_timesteps=1000,
-                solver_order=2,
-                prediction_type="flow_prediction",
-                shift=1.0
-            )
-            logger.info("Using custom FlowDPMSolverMultistepScheduler")
+        from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler
+        self.scheduler = FlowDPMSolverMultistepScheduler(
+            num_train_timesteps=1000,
+            solver_order=2,
+            prediction_type="flow_prediction",
+            shift=1.0
+        )
+        logger.info("Using custom FlowDPMSolverMultistepScheduler")
+
     
     def process_audio(self, audio_features: torch.Tensor) -> torch.Tensor:
         """Process audio features into tokens.

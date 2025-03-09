@@ -45,7 +45,7 @@ sapiens:
 
 # Dataset configuration
 data:
-  data_dir: "/path/to/data"
+  data_dir: "./junk"
   frame_size: [256, 256]
   heatmap_size: [64, 64]
   min_quality_score: 0.7

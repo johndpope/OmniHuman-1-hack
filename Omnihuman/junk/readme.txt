@@ -1,0 +1,1 @@
+save this mp4 here - https://www.reddit.com/r/StableDiffusion/comments/1ihjxii/can_we_hope_for_omnihuman1_to_be_released/
