@@ -6,9 +6,9 @@ from wan import WanT2V
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae import WanVAE
 from wan.configs import t2v_14B  # Example config, adjust as needed
-from utils.fm_solvers import FlowDPMSolverMultistepScheduler
+from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler
 from logger import logger
-
+from omegaconf import DictConfig, OmegaConf
 
 class OmniConditionsModule(nn.Module):
     """Processes and combines multiple modality conditions for OmniHuman."""
