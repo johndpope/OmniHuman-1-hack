@@ -28,7 +28,7 @@ class VideoEventData:
             from time import time
             self.timestamp = time()
 
-class ProblematicVideosTracker:
+class ProblematicVideoTracker:
     """Singleton tracker for problematic video events."""
     
     _instance = None
@@ -36,12 +36,12 @@ class ProblematicVideosTracker:
     
     def __new__(cls, output_dir: Optional[Path] = None):
         if cls._instance is None:
-            cls._instance = super(ProblematicVideosTracker, cls).__new__(cls)
+            cls._instance = super(ProblematicVideoTracker, cls).__new__(cls)
         return cls._instance
         
     def __init__(self, output_dir: Optional[Path] = None):
         # Only initialize once
-        if not ProblematicVideosTracker._initialized:
+        if not ProblematicVideoTracker._initialized:
             if output_dir is None:
                 raise ValueError("output_dir must be provided for initial initialization")
                 
@@ -68,15 +68,15 @@ class ProblematicVideosTracker:
             # Register default handlers
             self.register_default_handlers()
             
-            ProblematicVideosTracker._initialized = True
-            logger.info(f"Initialized ProblematicVideosTracker with output dir: {output_dir}")
+            ProblematicVideoTracker._initialized = True
+            logger.info(f"Initialized ProblematicVideoTracker with output dir: {output_dir}")
 
     @classmethod
-    def get_instance(cls) -> 'ProblematicVideosTracker':
+    def get_instance(cls) -> 'ProblematicVideoTracker':
         """Get singleton instance."""
         if cls._instance is None:
             raise RuntimeError(
-                "ProblematicVideosTracker not initialized. "
+                "ProblematicVideoTracker not initialized. "
                 "Create an instance with output_dir first."
             )
         return cls._instance

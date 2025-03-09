@@ -83,50 +83,100 @@ class SapiensKeypointProcessor:
                 logger.error(f"Failed to load detector: {e}")
                 
     @torch.inference_mode()
-    def extract_keypoints(self, image: Union[str, Path, Image.Image]) -> np.ndarray:
-        """Extract keypoints from an image.
-        
-        Args:
-            image: PIL Image or path to image
+    def _extract_keypoints(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Extract keypoints from frame."""
+        if not self.keypoint_processor:
+            return None
             
-        Returns:
-            Array of keypoints [num_keypoints, 3] (x, y, confidence)
-        """
-        # Load image if path is provided
-        if isinstance(image, (str, Path)):
-            image = Image.open(image).convert("RGB")
+        try:
+            logger.debug(f"Input frame type: {type(frame)}, shape: {frame.shape}")
             
-        # Process through detector if available
-        if self.detector:
-            try:
-                from detector_utils import process_images_detector
-                image_np = np.array(image)
-                image_np = np.expand_dims(image_np, axis=0)
-                bboxes_batch = process_images_detector(image_np, self.detector)
-                bboxes = self._get_person_bboxes(bboxes_batch[0])
+            # Convert to correct format if needed
+            if isinstance(frame, torch.Tensor):
+                frame = frame.permute(1, 2, 0).cpu().numpy()
+                logger.debug(f"Converted tensor to numpy, new shape: {frame.shape}")
                 
-                if not bboxes:
-                    logger.warning("No person detected in the image")
-                    return np.zeros((self.num_keypoints, 3), dtype=np.float32)
+            # Scale to 0-255 range if needed
+            if frame.max() <= 1.0:
+                frame = (frame * 255).astype(np.uint8)
+                logger.debug(f"Scaled frame to 0-255 range, max value: {frame.max()}")
+                
+            # Ensure correct color format (RGB)
+            if frame.shape[2] == 4:  # RGBA
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+                logger.debug("Converted from RGBA to RGB")
+            elif frame.shape[2] == 3:  # Assume RGB
+                logger.debug("Frame is already in RGB format")
+            elif frame.shape[2] == 1:  # Grayscale
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                logger.debug("Converted from grayscale to RGB")
+            else:
+                raise ValueError(f"Unexpected frame shape: {frame.shape}")
                     
-                # Use the first person bbox
-                bbox = bboxes[0]
-                x1, y1, x2, y2 = map(int, bbox[:4])
-                cropped_image = image.crop((x1, y1, x2, y2))
-            except Exception as e:
-                logger.error(f"Detection failed: {e}")
-                cropped_image = image  # Fallback to full image
-        else:
-            cropped_image = image
+            # Extract keypoints
+            logger.debug("Calling keypoint processor's extract_keypoints method")
+            keypoints = self.keypoint_processor.extract_keypoints(frame)
+            logger.debug(f"Received keypoints of type: {type(keypoints)}")
             
-        # Process image through Sapiens model
-        input_tensor = self.transform(cropped_image).unsqueeze(0).to(self.device)
-        heatmaps = self.model(input_tensor)
-        
-        # Convert heatmaps to keypoints
-        keypoints = self._heatmaps_to_keypoints(heatmaps[0].cpu().numpy())
-        
-        return keypoints
+            if keypoints is not None:
+                if isinstance(keypoints, dict):
+                    logger.debug(f"Keypoints are in dictionary format with {len(keypoints)} entries")
+                    keypoints_array = np.zeros((self.num_keypoints, 3), dtype=np.float32)
+                    for i, name in enumerate(keypoints):
+                        if i < self.num_keypoints:
+                            keypoints_array[i] = keypoints[name]
+                    logger.debug(f"Converted dictionary to array with shape: {keypoints_array.shape}")
+                    return keypoints_array
+                elif isinstance(keypoints, np.ndarray):
+                    logger.debug(f"Keypoints are already in numpy array format with shape: {keypoints.shape}")
+                    # Ensure correct shape
+                    if keypoints.shape[0] != self.num_keypoints or keypoints.shape[1] != 3:
+                        logger.warning(f"Keypoints shape {keypoints.shape} doesn't match expected shape ({self.num_keypoints}, 3)")
+                        reshaped = np.zeros((self.num_keypoints, 3), dtype=np.float32)
+                        # Copy as much data as possible
+                        min_kpts = min(keypoints.shape[0], self.num_keypoints)
+                        min_dims = min(keypoints.shape[1] if len(keypoints.shape) > 1 else 1, 3)
+                        for i in range(min_kpts):
+                            for j in range(min_dims):
+                                if len(keypoints.shape) > 1:
+                                    reshaped[i, j] = keypoints[i, j]
+                                else:
+                                    reshaped[i, 0] = keypoints[i]
+                        logger.debug(f"Reshaped keypoints to {reshaped.shape}")
+                        return reshaped
+                    return keypoints
+                else:
+                    logger.warning(f"Unexpected keypoints type: {type(keypoints)}, attempting to convert")
+                    try:
+                        # Try to convert to numpy array
+                        keypoints_array = np.array(keypoints, dtype=np.float32)
+                        logger.debug(f"Converted to numpy array with shape: {keypoints_array.shape}")
+                        # Reshape if needed
+                        if keypoints_array.shape != (self.num_keypoints, 3):
+                            logger.warning(f"Array shape {keypoints_array.shape} needs reshaping to ({self.num_keypoints}, 3)")
+                            reshaped = np.zeros((self.num_keypoints, 3), dtype=np.float32)
+                            # Copy data if possible
+                            if len(keypoints_array.shape) >= 2:
+                                rows = min(keypoints_array.shape[0], self.num_keypoints)
+                                cols = min(keypoints_array.shape[1], 3)
+                                reshaped[:rows, :cols] = keypoints_array[:rows, :cols]
+                            logger.debug(f"Final reshaped array: {reshaped.shape}")
+                            return reshaped
+                        return keypoints_array
+                    except Exception as conv_error:
+                        logger.error(f"Conversion error: {str(conv_error)}")
+                        return np.zeros((self.num_keypoints, 3), dtype=np.float32)
+            else:
+                logger.warning("Keypoint processor returned None")
+                return np.zeros((self.num_keypoints, 3), dtype=np.float32)
+            
+        except Exception as e:
+            logger.error(f"Error extracting keypoints: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return np.zeros((self.num_keypoints, 3), dtype=np.float32)
+
+            
     
     def generate_heatmaps(self, keypoints: np.ndarray) -> np.ndarray:
         """Generate Gaussian heatmaps from keypoints.

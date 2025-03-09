@@ -1,5 +1,18 @@
 # OmniHuman-Seaweed Implementation Guide
 
+
+download this
+https://github.com/facebookresearch/sapiens
+
+update the omni_config.yaml with respective sapiens paths
+
+
+
+
+
+
+
+
 This guide outlines the integration of OmniHuman's multi-modal conditioning architecture with Seaweed-Wan's one-step video generation capability.
 
 ## 1. Architecture Overview

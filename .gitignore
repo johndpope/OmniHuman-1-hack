@@ -16,3 +16,10 @@ seaweed_apt/checkpoint_epoch_5/random_states_0.pkl
 Omnihuman/outputs/omnihuman_wan_v1/*
 Omnihuman/junk/*.mp4
 seaweed_apt/eval_images/*.png
+Omnihuman/junk/cache/keypoints/*.npy
+Omnihuman/junk/frames/*.jpg
+Omnihuman/junk/cache/audio/6051ed6664c5fe465cd658cbb21a1257.wav
+Omnihuman/junk/annotations.json
+Omnihuman/junk/cache/audio/audio_status.json
+Omnihuman/junk/cache/bad_videos/invalid_videos.txt
+Omnihuman/junk/cache/bad_videos/video_events.log
