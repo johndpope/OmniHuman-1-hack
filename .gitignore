@@ -14,3 +14,4 @@ seaweed_apt/dummy_data_480x832.pt
 seaweed_apt/checkpoint_epoch_5/random_states_0.pkl
 *.png
 Omnihuman/outputs/omnihuman_wan_v1/*
+Omnihuman/junk/*.mp4

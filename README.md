@@ -7,6 +7,13 @@
    - We can use this for training
    - Reference implementation: [https://github.com/johndpope/vertex-jumpstart](https://github.com/johndpope/vertex-jumpstart)
 
+
+
+
+![VideoFrame](./reference/videoframe_3699.png)
+
+
+
 ## Status: Implementing Consistency Distillation Training (Seaweed-APT)
 
 I'm attempting to leverage Wan2.1 as the base model instead of SD3.5. If successful, this would yield a distilled teacher/student diffusion in 1 step.
@@ -69,6 +76,8 @@ cd seaweed_apt
 https://github.com/johndpope/MegaPortrait-hack/issues/61
 
 
+
+
 ### Functional Specification: OmniHuman Recreation
 
 https://github.com/johndpope/OmniHuman-1-hack/blob/main/Omnihuman
@@ -86,7 +95,7 @@ This spec outlines the components required to recreate OmniHuman, focusing on mo
 **Purpose:** Defines the foundational structure for video generation using a Diffusion Transformer (DiT) backbone.
 
 - **Subcomponent 1.1: Pretrained Base Model Adapter**
-  - **Functionality:** Adapts a pretrained video diffusion model (e.g., Seaweed with MMDiT) as the starting point. ⛳️ <- we are here
+  - **Functionality:** Adapts a pretrained video diffusion model (e.g., Seaweed with MMDiT) as the starting point. 
   - **Inputs:** Pretrained weights from a general text-to-video model.
   - **Outputs:** Initialized DiT backbone for further conditioning and training.
   - **Requirements:** Supports integration of multiple modalities and retains text-to-video capabilities.
