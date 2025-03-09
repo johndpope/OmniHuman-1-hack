@@ -17,21 +17,43 @@ https://wandb.ai/snoozie/seaweed-apt-distillation
 
 **Note**: There are many similar models being developed - [https://arxiv.org/html/2502.15681v1](https://arxiv.org/html/2502.15681v1)
 
-### Current Challenge
-I'm not 100% confident in combining these two discrete models:
-- [Wan-AI/Wan2.1-T2V-14B-480P](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-480P) (text to video)
-- [Wan-AI/Wan2.1-I2V-14B-480P](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P) (image to video)
+
 
 ### Progress
-**DRAFTED - Stage 1 of 2** (yet to complete a training pass)
+**DRAFTED - Stage 1 of 2** (✅ - doing a training pass on 24gb gpu)
 - Implementation: [distilled_trainer.py](https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/distilled_trainer.py)
 
+
+
+./generate.sh will prepare training data for WAN portrait video - 
+SIZE_CONFIGS["480*832"] 
+there's a vae_stride = (4, 8, 8) -> so the tensors become 60, 104
+the 16 is the feature channels. 
+```python
+num_samples = 100 # need to check this - duration of video frames
+v_teacher = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)  # Velocity field
+
+ data_dict = {
+        "dummy_data": dummy_data,
+        "noise": noise, # [16, 1, 60, 104]
+        "dummy_prompts": dummy_prompts,
+        "positive_contexts": positive_contexts,
+        "negative_context": negative_context,
+        "v_teacher": v_teacher
+    }
+```
+
+
 ```shell
+# need this for WANPipeline - WAN2.1 hasn't been released yet ...
+pip install git+https://github.com/huggingface/diffusers
+
 # ~ 18GB https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/main
 pip install "huggingface_hub[cli]"
 # huggingface-cli download Wan-AI/I2V-14B-480P --local-dir ./models/I2V-14B-480P
 huggingface-cli download https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B --local-dir ./models/Wan2.1-T2V-1.3B
 cd seaweed_apt
+./generate.sh (will extract noise / latents from google's  a bunch of stuff) 
 ./train.sh
 ```
 
@@ -39,7 +61,7 @@ cd seaweed_apt
 - Implementation: [apt_trainer.py](https://github.com/johndpope/OmniHuman-1-hack/blob/main/seaweed_apt/apt_trainer.py)
 
 ### TODO
-- Datasets / dataloaders - in progress
+- Train 9000 + samples for 350 epochs across 100+ GPUS
 
 
 

@@ -140,26 +140,9 @@ RANDOM_PROMPTS = [
     "A whimsical train journey through a land of candy",
 ]
 
-def generate_batch(config, args, num_samples=100):
-    rank = 0
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.debug(f"Using device: {device}")
+def generate_batch(wan_t2v, num_samples=100):
 
-    if not hasattr(config, 'text_len'):
-        config.text_len = 512
-        logger.warning("Config missing 'text_len'. Defaulting to 512.")
 
-    # Initialize full WanT2V object
-    wan_t2v = wan.WanT2V(
-        config=config,
-        checkpoint_dir=args.checkpoint_dir,
-        device_id=0,
-        rank=rank,
-        t5_fsdp=args.t5_fsdp,
-        dit_fsdp=args.dit_fsdp,
-        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
-        t5_cpu=args.t5_cpu
-    )
 
     dummy_prompts = RANDOM_PROMPTS[:num_samples]
     base_seed = random.randint(0, sys.maxsize) if not hasattr(config, 'base_seed') else config.base_seed
@@ -177,6 +160,16 @@ def generate_batch(config, args, num_samples=100):
               (target_shape[3] // patch_size[2])
     logger.info(f"Computed seq_len: {seq_len}")
 
+
+        # Why [16, 1, 60, 104]?
+        # It’s the latent shape for one frame of a 480x832 video after VAE encoding with stride [4, 8, 8]:
+        # 16: Latent channels (z_dim).
+        # 60: Height ( 480÷8).
+        # 104: Width (832÷8).
+        # 1: Single temporal frame, with full sequence (e.g., 4 frames from 16) handled by the model or decoding.
+        # What’s the 1 for?
+        # It’s the temporal dimension, set to 1 to generate noise for a single latent frame per sample. This aligns with per-timestep diffusion (e.g., computing v_teacher at T-1), simplifying the batch to 100 independent frames rather than full videos.
+    
     # Precompute contexts
     logger.info("Preprocessing text contexts...")
     wan_t2v.text_encoder.model.to(device)
@@ -268,89 +261,11 @@ def generate_batch(config, args, num_samples=100):
                 f"positive_contexts[0]={positive_contexts[0].shape}, negative_context={negative_context.shape}, "
                 f"v_teacher={v_teacher.shape}")
 
+    visualize_and_save_batch_with_vae(data_dict, wan_t2v)
+
+
+    
     return data_dict
-
-# Adjusted Dataset for Testing
-# class TextVideoDataset(Dataset):
-#     """
-#     Dataset for handling precomputed tensors for APT (Adversarial Post-Training).
-#     This version handles batch dimension issues and ensures correct tensor shapes.
-#     """
-#     def __init__(self, data_path):
-#         """
-#         Initialize dataset from precomputed tensors.
-        
-#         Args:
-#             data_path (str): Path to precomputed tensor file (.pt)
-#         """
-#         logger.info(f"Loading data from {data_path}")
-#         if not os.path.exists(data_path):
-#             raise FileNotFoundError(f"Data file {data_path} not found. Please generate data first.")
-        
-#         # Load precomputed data
-#         data_dict = torch.load(data_path, map_location='cpu')
-        
-#         # Extract tensors with shape validation
-#         self.samples = data_dict['dummy_data']  # Shape: [num_samples, 16, 1, 60, 104]
-#         self.noise = data_dict['noise']          # Shape: [num_samples, 16, 1, 60, 104]
-#         self.positive_contexts = data_dict['positive_contexts']  # List of [512, 4096] tensors
-#         self.negative_context = data_dict['negative_context']    # Shape: [512, 4096]
-#         self.v_teacher = data_dict['v_teacher']  # Shape: [num_samples, 16, 1, 60, 104]
-        
-#         self.num_samples = len(self.samples)
-        
-#         # Log shapes for debugging
-#         logger.info(f"Dataset initialized with {self.num_samples} samples")
-#         logger.info(f"Tensor shapes: samples={self.samples.shape}, noise={self.noise.shape}, "
-#                    f"positive_contexts[0]={self.positive_contexts[0].shape}, "
-#                    f"negative_context={self.negative_context.shape}, "
-#                    f"v_teacher={self.v_teacher.shape}")
-        
-#         # Validate shapes
-#         self._validate_shapes()
-
-#     def _validate_shapes(self):
-#         """Validate tensor shapes to catch issues early"""
-#         expected_sample_shape = (16, 1, 60, 104)
-#         expected_context_shape = (512, 4096)
-        
-#         # Check first sample shape (excluding batch dimension)
-#         sample_shape = tuple(self.samples[0].shape)
-#         if sample_shape != expected_sample_shape:
-#             logger.warning(f"Sample shape mismatch: got {sample_shape}, expected {expected_sample_shape}")
-        
-#         # Check first positive context shape
-#         context_shape = tuple(self.positive_contexts[0].shape)
-#         if context_shape != expected_context_shape:
-#             logger.warning(f"Positive context shape mismatch: got {context_shape}, expected {expected_context_shape}")
-        
-#         # Check negative context shape
-#         neg_context_shape = tuple(self.negative_context.shape)
-#         if neg_context_shape != expected_context_shape:
-#             logger.warning(f"Negative context shape mismatch: got {neg_context_shape}, expected {expected_context_shape}")
-
-#     def __len__(self):
-#         """Return number of samples in dataset"""
-#         return self.num_samples
-
-#     def __getitem__(self, idx):
-#         """
-#         Get a training example.
-        
-#         Returns:
-#             tuple: (noise, positive_context, negative_context, v_teacher)
-#                 - noise: Shape [16, 1, 60, 104] - The input noise
-#                 - positive_context: Shape [512, 4096] - Positive text embedding
-#                 - negative_context: Shape [512, 4096] - Negative text embedding
-#                 - v_teacher: Shape [16, 1, 60, 104] - Target prediction
-#         """
-#         # Get specific samples by index
-#         noise = self.noise[idx]  # [16, 1, 60, 104]
-#         v_teacher = self.v_teacher[idx]  # [16, 1, 60, 104]
-#         positive_context = self.positive_contexts[idx]  # [512, 4096]
-        
-#         # Return tensors with correct shapes for model input
-#         return noise, positive_context, self.negative_context, v_teacher
 
 def create_dataloader(data_path, batch_size=1):
     dataset = TextVideoDataset(data_path)
@@ -382,6 +297,145 @@ def test_dataset(data_path="dummy_data_480x832.pt"):
         return True
     except Exception as e:
         logger.error(f"Error testing dataset: {e}")
+        return False
+
+
+
+def visualize_and_save_batch_with_vae(data_dict, wan_t2v, filename="sample_visualization_vae.png"):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import torch
+    
+    # Get sample from data_dict
+    noise = data_dict["noise"][0:1]  # Shape: [1, 16, 1, 60, 104]
+    v_teacher = data_dict["v_teacher"][0:1]  # Shape: [1, 16, 1, 60, 104]
+    
+    # Calculate predicted x0 as: x0 = noise - v_teacher
+    x0_pred = noise - v_teacher
+    
+    # Decode latents with VAE
+    with torch.no_grad():
+        print("Decoding noise...")
+        noise_pixel = wan_t2v.vae.decode([noise.squeeze(0)])
+        
+        print("Decoding teacher prediction...")
+        v_teacher_pixel = wan_t2v.vae.decode([v_teacher.squeeze(0)])
+        
+        print("Decoding predicted x0...")
+        x0_pixel = wan_t2v.vae.decode([x0_pred.squeeze(0)])
+    
+    # Convert to numpy arrays for visualization (taking the first frame)
+    noise_img = ((noise_pixel[0][:, 0, :, :].permute(1, 2, 0).cpu().numpy() + 1) / 2).clip(0, 1)
+    v_teacher_img = ((v_teacher_pixel[0][:, 0, :, :].permute(1, 2, 0).cpu().numpy() + 1) / 2).clip(0, 1)
+    x0_img = ((x0_pixel[0][:, 0, :, :].permute(1, 2, 0).cpu().numpy() + 1) / 2).clip(0, 1)
+    
+    # Create figure for visualization
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # Plot the images
+    axes[0].imshow(noise_img)
+    axes[0].set_title("Noise")
+    axes[0].axis('off')
+    
+    axes[1].imshow(v_teacher_img)
+    axes[1].set_title("Teacher Velocity Field")
+    axes[1].axis('off')
+    
+    axes[2].imshow(x0_img)
+    axes[2].set_title("Predicted x0 (should be blurry)")
+    axes[2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    
+    print(f"Saved VAE-decoded visualization to {filename}")
+    
+    # Also save individual images
+    plt.figure(figsize=(5, 5))
+    plt.imshow(x0_img)
+    plt.title("VAE-decoded x0 prediction")
+    plt.axis('off')
+    plt.savefig("x0_prediction.png")
+    plt.close()
+    
+    return x0_img
+
+
+def test_diffusers_pipeline(wan_t2v, prompt="A beautiful landscape with mountains and a lake", size=(480, 832), cfg_scale=7.5, seed=42):
+    """
+    Standalone function to test the model with diffusers pipeline using a single dummy prompt.
+    
+    Args:
+        wan_t2v: The WanT2V model
+        prompt: Text prompt to use
+        size: Output image size (height, width)
+        cfg_scale: Classifier-free guidance scale
+        seed: Random seed for reproducibility
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    import os
+    import torch
+    import numpy as np
+    from PIL import Image
+    
+    device = wan_t2v.device
+    logger.info(f"Testing diffusers pipeline with prompt: '{prompt}'")
+    
+    try:
+        # Import diffusers components
+        from diffusers import FlowMatchEulerDiscreteScheduler, WanPipeline
+        
+        # Create scheduler
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=wan_t2v.num_train_timesteps,
+            shift=1.0,
+        )
+        
+        # Initialize pipeline
+        pipe = WanPipeline(
+            tokenizer=wan_t2v.text_encoder.tokenizer,
+            text_encoder=wan_t2v.text_encoder.model,
+            transformer=wan_t2v.model,
+            vae=wan_t2v.vae.model,
+            scheduler=scheduler
+        )
+        
+        # Move to device
+        pipe = pipe.to(device)
+        logger.info("Successfully initialized diffusers pipeline")
+        
+        # Set seed for reproducibility
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
+        # Run pipeline
+        logger.info("Running diffusers pipeline...")
+        output = pipe(
+            prompt=prompt,
+            negative_prompt=wan_t2v.sample_neg_prompt,
+            height=size[0], 
+            width=size[1],
+            num_frames=1,  # Just generate a single frame
+            num_inference_steps=1,  # One-step generation
+            guidance_scale=cfg_scale,
+            generator=generator,
+            output_type="np",
+        )
+        
+        # Extract and save the generated image
+        image = output.frames[0][0]  # First batch, first frame
+        os.makedirs("test_outputs", exist_ok=True)
+        Image.fromarray((image * 255).astype(np.uint8)).save("test_outputs/diffusers_test.png")
+        logger.info("Successfully generated and saved image to test_outputs/diffusers_test.png")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error testing diffusers pipeline: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -421,9 +475,37 @@ if __name__ == "__main__":
     parser.add_argument("--t5_fsdp", action="store_true", default=False, help="Whether to use FSDP for T5.")
     args = parser.parse_args()
     
+
     from wan.configs import t2v_14B, t2v_1_3B
-    data_dict = generate_batch(t2v_1_3B, args,num_samples=100)
+    config = t2v_1_3B
+    if not hasattr(config, 'text_len'):
+        config.text_len = 512
+        logger.warning("Config missing 'text_len'. Defaulting to 512.")
+
+    # Initialize full WanT2V object
+    wan_t2v = wan.WanT2V(
+        config=config,
+        checkpoint_dir=args.checkpoint_dir,
+        device_id=0,
+        rank=0,
+        t5_fsdp=args.t5_fsdp,
+        dit_fsdp=args.dit_fsdp,
+        use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+        t5_cpu=args.t5_cpu
+    )
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logger.debug(f"Using device: {device}")
+
+    logger.info("Preprocessing text contexts...")
+    wan_t2v.text_encoder.model.to(device)
+
+    data_dict = generate_batch(wan_t2v, num_samples=100)
+    # test_diffusers_pipeline(wan_t2v, prompt="A beautiful landscape with mountains and a lake", size=(480, 832), cfg_scale=7.5, seed=42)
+   
     
+    # Call this function at the end of generate_batch
+    visualize_and_save_batch_with_vae(data_dict)
+
     success = test_dataset()
     if success:
         logger.info("Dataset test successful!")

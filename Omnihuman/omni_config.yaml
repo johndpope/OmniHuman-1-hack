@@ -1,0 +1,88 @@
+# OmniHuman configuration with multi-stage training and Sapiens 308 keypoints
+
+# General configuration
+output_dir: "./outputs/omnihuman_wan_v1"
+seed: 42
+debug: false
+use_wandb: true
+wandb_project: "OmniHuman"
+wandb_group: "wan_t2v"
+wandb_tags: ["sapiens", "308_keypoints", "flow_matching"]
+
+# Model configuration
+model_type: "omnihuman_wan_t2v"
+num_frames: 49
+num_keypoints: 308  # Sapiens 308 keypoints
+model_dim: 5120
+audio_dim: 1024
+negative_prompt: ""
+latent_height: 64
+latent_width: 64
+checkpoint_dir: "./checkpoints/want2v"
+
+# Training configuration
+learning_rate: 1e-4
+min_lr: 1e-6
+optimizer_type: "AdamW"
+scheduler_type: "cosine"
+weight_decay: 0.01
+beta1: 0.9
+beta2: 0.999
+batch_size: 4
+num_workers: 4
+max_grad_norm: 1.0
+mixed_precision: "fp16"
+gradient_accumulation_steps: 2
+log_interval: 100
+checkpoint_interval: 1000
+
+# Sapiens keypoint configuration
+sapiens:
+  checkpoints_dir: "/media/oem/12TB/sapiens/pretrain/sapiens_lite_host/torchscript/pose/checkpoints"
+  model_name: "1b"
+  detection_config: "/media/oem/12TB/sapiens/pose/demo/mmdetection_cfg/rtmdet_m_640-8xb32_coco-person_no_nms.py"
+  detection_checkpoint: "/media/oem/12TB/sapiens/pretrain/sapiens_host/detector/checkpoints/rtmpose/rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth"
+
+# Dataset configuration
+data:
+  data_dir: "/path/to/data"
+  frame_size: [256, 256]
+  heatmap_size: [64, 64]
+  min_quality_score: 0.7
+  min_motion_score: 0.5
+  sapiens_checkpoints_dir: ${sapiens.checkpoints_dir}
+  sapiens_model_name: ${sapiens.model_name}
+  sapiens_detection_config: ${sapiens.detection_config}
+  sapiens_detection_checkpoint: ${sapiens.detection_checkpoint}
+
+# Multi-stage training configuration
+# Following OmniHuman's training principles:
+# 1. Stronger conditions can leverage weaker condition data for scaling
+# 2. Stronger conditions should have lower training ratios to prevent overfitting
+stages:
+  # Stage 1: Text and reference only (weakest conditions)
+  - name: "text_reference"
+    num_steps: 50000
+    condition_ratios:
+      text: 1.0
+      reference: 1.0
+      audio: 0.0
+      pose: 0.0
+
+  # Stage 2: Add audio, drop pose
+  - name: "text_reference_audio"
+    num_steps: 30000
+    condition_ratios:
+      text: 1.0
+      reference: 1.0
+      audio: 0.5  # Halved from text/reference
+      pose: 0.0
+
+  # Stage 3: All conditions with balanced ratios
+  - name: "all_conditions"
+    num_steps: 20000
+    condition_ratios:
+      text: 1.0    # Weakest condition, full ratio
+      reference: 1.0
+      audio: 0.25  # Stronger, reduced ratio
+      pose: 0.13   # Strongest, lowest ratio

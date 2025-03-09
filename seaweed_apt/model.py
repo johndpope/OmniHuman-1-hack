@@ -1,3 +1,4 @@
+# Copyright 2024-2025 @johndpope All rights reserved.
 import copy
 import math
 import torch
