@@ -513,7 +513,7 @@ class OmniHumanDataset(Dataset):
         with open(audio_status_file, 'w') as f:
             json.dump(self.audio_status, f, indent=2)
     
-    def _extract_keypoints(self, frame: np.ndarray) -> Optional[np.ndarray]:
+    def extract_keypoints(self, frame: np.ndarray) -> Optional[np.ndarray]:
         """Extract keypoints from frame."""
         if not self.keypoint_processor:
             return None
@@ -617,7 +617,7 @@ class OmniHumanDataset(Dataset):
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     
                     # Extract keypoints
-                    keypoints = self._extract_keypoints(frame)
+                    keypoints = self.extract_keypoints(frame)
                     if keypoints is None:
                         logger.warning(f"Failed to extract keypoints for frame {frame_idx} from {video_path}")
                         self.tracker.dispatch(VideoEventData(
@@ -989,7 +989,7 @@ class OmniHumanDataset(Dataset):
                             if frame_np.max() <= 1.0:
                                 frame_np = (frame_np * 255).astype(np.uint8)
                             # Extract keypoints
-                            keypoints = self._extract_keypoints(frame_np)
+                            keypoints = self.extract_keypoints(frame_np)
                             if keypoints is not None:
                                 new_keypoints.append(keypoints)
                                 # Cache keypoints

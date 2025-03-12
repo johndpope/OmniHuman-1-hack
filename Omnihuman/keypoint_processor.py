@@ -8,9 +8,8 @@ import cv2
 import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
-
-
-
+from detector_utils import  adapt_mmdet_pipeline,process_images_detector
+from mmdet.apis import  init_detector
 
 # https://raw.githubusercontent.com/johndpope/EAI/refs/heads/main/pose_vis.py
 
@@ -73,21 +72,19 @@ class SapiensKeypointProcessor:
         self.detector = None
         if detection_config and detection_checkpoint:
             try:
-                from detector_utils import init_detector, adapt_mmdet_pipeline
+                
                 self.detector = init_detector(detection_config, detection_checkpoint, device=device)
                 self.detector.cfg = adapt_mmdet_pipeline(self.detector.cfg)
                 logger.info(f"Loaded detector from {detection_checkpoint}")
             except ImportError:
                 logger.warning("detector_utils not found, detection will not be available")
+                exit()
             except Exception as e:
                 logger.error(f"Failed to load detector: {e}")
                 
     @torch.inference_mode()
-    def _extract_keypoints(self, frame: np.ndarray) -> Optional[np.ndarray]:
+    def extract_keypoints(self, frame: np.ndarray) -> Optional[np.ndarray]:
         """Extract keypoints from frame."""
-        if not self.keypoint_processor:
-            return None
-            
         try:
             logger.debug(f"Input frame type: {type(frame)}, shape: {frame.shape}")
             
@@ -112,63 +109,42 @@ class SapiensKeypointProcessor:
                 logger.debug("Converted from grayscale to RGB")
             else:
                 raise ValueError(f"Unexpected frame shape: {frame.shape}")
-                    
-            # Extract keypoints
-            logger.debug("Calling keypoint processor's extract_keypoints method")
-            keypoints = self.keypoint_processor.extract_keypoints(frame)
-            logger.debug(f"Received keypoints of type: {type(keypoints)}")
             
-            if keypoints is not None:
-                if isinstance(keypoints, dict):
-                    logger.debug(f"Keypoints are in dictionary format with {len(keypoints)} entries")
-                    keypoints_array = np.zeros((self.num_keypoints, 3), dtype=np.float32)
-                    for i, name in enumerate(keypoints):
-                        if i < self.num_keypoints:
-                            keypoints_array[i] = keypoints[name]
-                    logger.debug(f"Converted dictionary to array with shape: {keypoints_array.shape}")
-                    return keypoints_array
-                elif isinstance(keypoints, np.ndarray):
-                    logger.debug(f"Keypoints are already in numpy array format with shape: {keypoints.shape}")
-                    # Ensure correct shape
-                    if keypoints.shape[0] != self.num_keypoints or keypoints.shape[1] != 3:
-                        logger.warning(f"Keypoints shape {keypoints.shape} doesn't match expected shape ({self.num_keypoints}, 3)")
-                        reshaped = np.zeros((self.num_keypoints, 3), dtype=np.float32)
-                        # Copy as much data as possible
-                        min_kpts = min(keypoints.shape[0], self.num_keypoints)
-                        min_dims = min(keypoints.shape[1] if len(keypoints.shape) > 1 else 1, 3)
-                        for i in range(min_kpts):
-                            for j in range(min_dims):
-                                if len(keypoints.shape) > 1:
-                                    reshaped[i, j] = keypoints[i, j]
-                                else:
-                                    reshaped[i, 0] = keypoints[i]
-                        logger.debug(f"Reshaped keypoints to {reshaped.shape}")
-                        return reshaped
-                    return keypoints
-                else:
-                    logger.warning(f"Unexpected keypoints type: {type(keypoints)}, attempting to convert")
-                    try:
-                        # Try to convert to numpy array
-                        keypoints_array = np.array(keypoints, dtype=np.float32)
-                        logger.debug(f"Converted to numpy array with shape: {keypoints_array.shape}")
-                        # Reshape if needed
-                        if keypoints_array.shape != (self.num_keypoints, 3):
-                            logger.warning(f"Array shape {keypoints_array.shape} needs reshaping to ({self.num_keypoints}, 3)")
-                            reshaped = np.zeros((self.num_keypoints, 3), dtype=np.float32)
-                            # Copy data if possible
-                            if len(keypoints_array.shape) >= 2:
-                                rows = min(keypoints_array.shape[0], self.num_keypoints)
-                                cols = min(keypoints_array.shape[1], 3)
-                                reshaped[:rows, :cols] = keypoints_array[:rows, :cols]
-                            logger.debug(f"Final reshaped array: {reshaped.shape}")
-                            return reshaped
-                        return keypoints_array
-                    except Exception as conv_error:
-                        logger.error(f"Conversion error: {str(conv_error)}")
+            # Process frame through detector if available
+            if self.detector:
+                try:
+              
+                    image_np = np.array(frame)
+                    image_np = np.expand_dims(image_np, axis=0)
+                    bboxes_batch = process_images_detector(image_np, self.detector)
+                    bboxes = self._get_person_bboxes(bboxes_batch[0])
+                    
+                    if not bboxes:
+                        logger.warning("No person detected in the image")
                         return np.zeros((self.num_keypoints, 3), dtype=np.float32)
+                        
+                    # Use the first person bbox
+                    bbox = bboxes[0]
+                    x1, y1, x2, y2 = map(int, bbox[:4])
+                    cropped_frame = frame[y1:y2, x1:x2]
+                except Exception as e:
+                    logger.error(f"Detection failed: {e}")
+                    cropped_frame = frame  # Fallback to full image
             else:
-                logger.warning("Keypoint processor returned None")
-                return np.zeros((self.num_keypoints, 3), dtype=np.float32)
+                cropped_frame = frame
+                
+            # Convert numpy array to PIL Image
+            frame_pil = Image.fromarray(cropped_frame)
+            
+            # Process image through Sapiens model
+            input_tensor = self.transform(frame_pil).unsqueeze(0).to(self.device)
+            heatmaps = self.model(input_tensor)
+            
+            # Convert heatmaps to keypoints
+            keypoints = self._heatmaps_to_keypoints(heatmaps[0].cpu().numpy())
+            
+            logger.debug(f"Generated keypoints with shape: {keypoints.shape}")
+            return keypoints
             
         except Exception as e:
             logger.error(f"Error extracting keypoints: {str(e)}")
