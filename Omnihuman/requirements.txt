@@ -1,6 +1,5 @@
 git+https://github.com/huggingface/diffusers
 mmcv>=2.0.0rc4,<2.2.0
 mmengine>=0.5.0,<1.0.0
-multiprocessing
 tqdm
 mmdet>=3.0.0,<3.2.0
